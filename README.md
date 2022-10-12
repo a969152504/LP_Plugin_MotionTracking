@@ -1,4 +1,5 @@
 # LP_Plugin_MotionTracking
+
 Motion Tracking plugin for SmartFashion  
 Using Kinect Azure Body Tracking SDK  
 and Skeleton Optimization algorithm from the paper below  

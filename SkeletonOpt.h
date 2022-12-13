@@ -39,7 +39,6 @@ private:
 	double _func(double* x);
 	void _dfunc(double* x, double* df);
 
-private:
     int modelNum = 0;
     int vertNum = 0;
     int edgeNum = 0;

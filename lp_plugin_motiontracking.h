@@ -36,6 +36,7 @@
 #include <Utilities.h>
 
 #include <SkeletonOpt.h>
+#include <kinect_azure_functions.h>
 
 #include <chrono>
 #include <cstdlib>
@@ -102,51 +103,77 @@ public slots:
 protected:
     void RunCamera();
     void VisualizeResult(k4abt_frame_t bodyFrame,
-                         k4a_calibration_t sensorCalibration, int dev_ind);
+                         k4a_calibration_t sensorCalibration,
+                         k4a_transformation_t transformation,
+                         int dev_ind);
     void keyReleaseEvent(QKeyEvent *event);
     r_t rigid_transform_3D(cv::Mat A, cv::Mat B);
     void rigid_transform_3D_test();
 
+    void save_Rt(cv::Mat Aligned_skeb);
     void save_samples();
 
+    void create_paths();
     void loadObj(const char *filename,
                  std::vector<std::array<float, 6>> &vao,
                  std::vector<uint> &f);
     void save_obj(std::string path, cv::Mat mat);
     void save_obj(std::string path, k4abt_skeleton_t *ske);
-
-    QFuture<void> gFuture;
+    struct SkeData
+    {
+        uint64_t StartTime = 0;
+        std::vector<cv::Mat> colorMats0, colorMats1, colorMatoris0, colorMatoris1, irMats0, irMats1, optskeMats0, optskeMats1;
+        //std::vector<cv::Point> ELBOW_LEFT0, WRIST_LEFT0, ELBOW_LEFT1, WRIST_LEFT1;
+        std::vector<k4abt_skeleton_t> skes0, skes1, skes1ori, optskes0, optskes1;
+        std::vector<uint64_t> cam0_t, cam1_t, cam0_t_ori, cam1_t_ori;
+        std::vector<float> Timestamps;
+        std::vector<std::vector<k4a_float3_t>> Joint_posis, Joint_velo;
+    };
+    SkeData mSkeData;
 
     bool mSave_samples = true;
     std::string mCamtime_path = "/home/cpii/Desktop/test_img/not_syn_time.csv";
+    std::string mCamtimeori_path = "/home/cpii/Desktop/test_img/not_syn_time_ori.csv";
     std::string mTimestamps_path = "/home/cpii/Desktop/test_img/time_stamps.csv";
     std::string mJointposi_path = "/home/cpii/Desktop/test_img/joint_posi.csv";
     std::string mJointvelo_path = "/home/cpii/Desktop/test_img/joint_velo.csv";
     std::string mJointacce_path = "/home/cpii/Desktop/test_img/joint_acce.csv";
     std::string mCam0_path = "/home/cpii/Desktop/test_img/cam0/";
-    std::string mCam0obj_path = "/home/cpii/Desktop/test_img/cam0obj/";
+    std::string mCam0ori_path = "/home/cpii/Desktop/test_img/cam0ori/";
+    std::string mCam0ske_path = "/home/cpii/Desktop/test_img/cam0ske/";
     std::string mCam1_path = "/home/cpii/Desktop/test_img/cam1/";
-    std::string mCam1obj_path = "/home/cpii/Desktop/test_img/cam1obj/";
+    std::string mCam1ori_path = "/home/cpii/Desktop/test_img/cam1ori/";
+    std::string mCam1ske_path = "/home/cpii/Desktop/test_img/cam1ske/";
+    std::string mCam1skeori_path = "/home/cpii/Desktop/test_img/cam1skeori/";
+    std::string mSke_path = "/home/cpii/Desktop/test_img/ske/";
     std::string mSke0_path = "/home/cpii/Desktop/test_img/ske0/";
     std::string mSke0obj_path = "/home/cpii/Desktop/test_img/ske0obj/";
     std::string mSke1_path = "/home/cpii/Desktop/test_img/ske1/";
     std::string mSke1obj_path = "/home/cpii/Desktop/test_img/ske1obj/";
     std::string mCam0ir_path = "/home/cpii/Desktop/test_img/cam0ir/";
     std::string mCam1ir_path = "/home/cpii/Desktop/test_img/cam1ir/";
+    //std::string mPointcloud_path0 = "/home/cpii/Desktop/test_img/Pointcloud0/";
+    //std::string mPointcloud_path1 = "/home/cpii/Desktop/test_img/Pointcloud1/";
+    //std::string m2dPoint_path = "/home/cpii/Desktop/test_img/2dPoint.csv";
+
+    QFuture<void> gFuture;
 
     int mCam_rows = 0, mCam_cols = 0, mDepthh = 0, mDepthw = 0;
     std::vector<k4a_calibration_t> sensorCalibrations;
 
     uint64_t mTmpFrametime = 0;
-    cv::Mat mTmpMat, mTmpirMat;
-    std::vector<uint64_t> cam0_t, cam1_t;
+    bool init_tmpmat = false;
+    cv::Mat mTmpMatA, mTmpMatB, mTmpMatOriA, mTmpMatOriB, mTmpirMatA, mTmpirMatB;
+    cv::Mat mTmpMatA_Last, mTmpMatB_Last, mTmpMatOriA_Last, mTmpMatOriB_Last, mTmpirMatA_Last, mTmpirMatB_Last;
+
+    //std::shared_ptr<Kinect_Azure_Functions> KAfunctions;
 
     // SkeOpt
     void SkeletonoperationInit(); // Initialize the "SkeletonOpt" Object
     void SkeletonoperationRunoptimization(int use_cam);
-    void checking_estpoint_new(k4abt_joint_t **skea, k4abt_joint_t **skeb);
-    void cam_prior_new(k4abt_joint_t **skea, k4abt_joint_t **skeb,
-                       int jointpoint);
+    void SkeletonoperationRunoptimizationall(int use_cam, int frame);
+    void checking_estpoint_new(k4abt_joint_t **skea, k4abt_joint_t **skeb, int use_cam);
+    void cam_prior_new(k4abt_joint_t **skea, k4abt_joint_t **skeb, int jointpoint, int use_cam);
     double smooth_step(double t);
     int choosing_dis(k4abt_joint_t **skea, k4abt_joint_t **skeb, int jointpoint);
 
@@ -154,14 +181,44 @@ protected:
     int mAvg_count = 0, optfps_count = 0;
     cv::Mat mKinectA_pts, mKinectB_pts;
     k4abt_skeleton_t mRest_skeleton, tmpbody_a, tmpbody_b, lastbody_b;
+    std::vector<k4abt_skeleton_t> bodyb_all;
     int mJoint_tmp_num = 0, joint_a_num = 0, joint_b_num = 0, mBone_tmp_num = 0, bone_a_num = 0, bone_b_num = 0;
 
-    std::vector<std::vector<k4a_float3_t>> mJoint_posis, mJoint_velo;
-    std::vector<float> mTimestamps;
+    std::shared_ptr<SkeletonOpt> skeOpt = nullptr;
+    // class for handing the optimization. Referring to attached SkeletonOpt.h and SkeletonOpt.cpp
+    std::vector<double> weighting_a, weighting_b;
 
-    SkeletonOpt *skeOpt = nullptr; // class for handing the optimization. Referring to
-                                   // attached SkeletonOpt.h and SkeletonOpt.cpp
-    std::vector<double> length_const, weighting_a, weighting_b;
+    // Joint Trajectory
+    struct poly_solu
+    {
+        float a0;
+        float a1;
+        float a2;
+        float a3;
+    };
+    struct poly_solu_xyz
+    {
+        poly_solu x;
+        poly_solu y;
+        poly_solu z;
+    };
+    struct Joint_Traj
+    {
+        int TrajFrame_Size = 5;
+        uint64_t StartTime = 0;
+        std::vector<k4abt_skeleton_t> Traj_skesB;
+        std::vector<std::vector<k4a_float3_t>> Traj_velB;
+        std::vector<uint64_t> Traj_timestampsA, Traj_timestampsB;
+        int tmpf = 1;
+    };
+    Joint_Traj mJoint_Traj;
+    void Process_JointTraj();
+    void erase_traj();
+    void Process_AllJointTraj();
+    poly_solu_xyz solve_polynomial_trajectory(k4a_float3_t po0, k4a_float3_t po1,
+                                              k4a_float3_t vel0, k4a_float3_t vel1,
+                                              float times0, float times1);
+    void cal_xyz(poly_solu_xyz solu, float time, int joint);
 };
 
 #endif // LP_PLUGIN_MOTIONTRACKING_H

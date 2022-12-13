@@ -1,4 +1,4 @@
-﻿#include "lp_plugin_motiontracking.h"
+#include "lp_plugin_motiontracking.h"
 
 #include "lp_renderercam.h"
 #include "lp_openmesh.h"
@@ -184,6 +184,331 @@ void LP_Plugin_MotionTracking::rigid_transform_3D_test(){
     QThread::msleep(-1);
 }
 
+LP_Plugin_MotionTracking::poly_solu_xyz LP_Plugin_MotionTracking::solve_polynomial_trajectory(k4a_float3_t po0, k4a_float3_t po1,
+                                                                                              k4a_float3_t vel0, k4a_float3_t vel1,
+                                                                                              float times0, float times1){
+    // Joint Space Trajectory Cubic
+    // solve Ax = b
+
+    poly_solu_xyz solu;
+
+    cv::Mat A = (cv::Mat_<double>(4, 4) << 1.0, times0, times0*times0, times0*times0*times0,
+                                           1.0, times1, times1*times1, times1*times1*times1,
+                                           0.0, 1.0, 2.0*times0, 3.0*times0*times0,
+                                           0.0, 1.0, 2.0*times1, 3.0*times1*times1);
+
+    cv::Mat bx = (cv::Mat_<double>(4, 1) << po0.xyz.x,
+                                            po1.xyz.x,
+                                            vel0.xyz.x,
+                                            vel1.xyz.x);
+    cv::Mat by = (cv::Mat_<double>(4, 1) << po0.xyz.y,
+                                            po1.xyz.y,
+                                            vel0.xyz.y,
+                                            vel1.xyz.y);
+    cv::Mat bz = (cv::Mat_<double>(4, 1) << po0.xyz.z,
+                                            po1.xyz.z,
+                                            vel0.xyz.z,
+                                            vel1.xyz.z);
+
+    cv::Mat solutionx = A.inv() * bx;
+    cv::Mat solutiony = A.inv() * by;
+    cv::Mat solutionz = A.inv() * bz;
+
+//    qDebug() << "times0: " << times0;
+//    qDebug() << "times1: " << times1;
+//    std::cout << "A:" << A << std::endl
+//              << "bx: " << bx << std::endl
+//              << "by: " << by << std::endl
+//              << "bz: " << bz << std::endl
+//              << "solutionx: " << solutionx << std::endl
+//              << "solutiony: " << solutiony << std::endl
+//              << "solutionz: " << solutionz << std::endl;
+
+    solu.x.a0 = solutionx.at<double>(0, 0);
+    solu.x.a1 = solutionx.at<double>(1, 0);
+    solu.x.a2 = solutionx.at<double>(2, 0);
+    solu.x.a3 = solutionx.at<double>(3, 0);
+    solu.y.a0 = solutiony.at<double>(0, 0);
+    solu.y.a1 = solutiony.at<double>(1, 0);
+    solu.y.a2 = solutiony.at<double>(2, 0);
+    solu.y.a3 = solutiony.at<double>(3, 0);
+    solu.z.a0 = solutionz.at<double>(0, 0);
+    solu.z.a1 = solutionz.at<double>(1, 0);
+    solu.z.a2 = solutionz.at<double>(2, 0);
+    solu.z.a3 = solutionz.at<double>(3, 0);
+
+    return solu;
+}
+
+void LP_Plugin_MotionTracking::cal_xyz(poly_solu_xyz solu, float time, int joint){
+    //qDebug() << "Calculating xyz";
+    tmpbody_b.joints[joint].position.xyz.x = solu.x.a0 + solu.x.a1*time + solu.x.a2*time*time + solu.x.a3*time*time*time;
+    tmpbody_b.joints[joint].position.xyz.y = solu.y.a0 + solu.y.a1*time + solu.y.a2*time*time + solu.y.a3*time*time*time;
+    tmpbody_b.joints[joint].position.xyz.z = solu.z.a0 + solu.z.a1*time + solu.z.a2*time*time + solu.z.a3*time*time*time;
+}
+
+void LP_Plugin_MotionTracking::Process_JointTraj(){
+    //qDebug() << "Processing joint trajectory";
+
+    k4a_float3_t tmp;
+    std::vector<float> times;
+    uint64_t Start_t = mJoint_Traj.Traj_timestampsA[0] < mJoint_Traj.Traj_timestampsB[0] ? mJoint_Traj.Traj_timestampsA[0] : mJoint_Traj.Traj_timestampsB[0];
+
+    for(int f=0; f<5; f++){
+        times.push_back(float(mJoint_Traj.Traj_timestampsB[f] - mJoint_Traj.Traj_timestampsB[0])*0.001);
+    }
+
+    if(mJoint_Traj.Traj_velB.empty()){
+        for(int f=0; f<5; f++){
+            std::vector<k4a_float3_t> tmp_vel;
+            for(int joint=0; joint<K4ABT_JOINT_COUNT; joint++){
+                if(f==0){
+                    tmp.xyz.x = 0.0;
+                    tmp.xyz.y = 0.0;
+                    tmp.xyz.z = 0.0;
+                    tmp_vel.push_back(tmp);
+                } else if(f==4){
+                    tmp.xyz.x = mJoint_Traj.Traj_velB[3][joint].xyz.x * 0.5;
+                    tmp.xyz.y = mJoint_Traj.Traj_velB[3][joint].xyz.y * 0.5;
+                    tmp.xyz.z = mJoint_Traj.Traj_velB[3][joint].xyz.z * 0.5;
+                    tmp_vel.push_back(tmp);
+                } else {
+                    k4a_float3_t tmp_j0 = mJoint_Traj.Traj_skesB[f-1].joints[joint].position;
+                    k4a_float3_t tmp_j1 = mJoint_Traj.Traj_skesB[f].joints[joint].position;
+                    k4a_float3_t tmp_j2 = mJoint_Traj.Traj_skesB[f+1].joints[joint].position;
+                    float t0 = times[f] - times[f-1];
+                    float t1 = times[f+1] - times[f];
+                    float v1_x = (tmp_j1.xyz.x - tmp_j0.xyz.x) / t0;
+                    float v2_x = (tmp_j2.xyz.x - tmp_j1.xyz.x) / t1;
+                    float v1_y = (tmp_j1.xyz.y - tmp_j0.xyz.y) / t0;
+                    float v2_y = (tmp_j2.xyz.y - tmp_j1.xyz.y) / t1;
+                    float v1_z = (tmp_j1.xyz.z - tmp_j0.xyz.z) / t0;
+                    float v2_z = (tmp_j2.xyz.z - tmp_j1.xyz.z) / t1;
+                    if(v1_x * v2_x > 0){
+                        tmp.xyz.x = v1_x * t0 + v2_x * t1;
+                    } else {
+                        tmp.xyz.x = 0.0;
+                    }
+                    if(v1_y * v2_y > 0){
+                        tmp.xyz.y = v1_y * t0 + v2_y * t1;
+                    } else {
+                        tmp.xyz.y = 0.0;
+                    }
+                    if(v1_z * v2_z > 0){
+                        tmp.xyz.z = v1_z * t0 + v2_z * t1;
+                    } else {
+                        tmp.xyz.z = 0.0;
+                    }
+                    tmp_vel.push_back(tmp);
+                }
+            }
+            mJoint_Traj.Traj_velB.push_back(tmp_vel);
+        }
+    } else {
+        for(int f=3; f<5; f++){
+            std::vector<k4a_float3_t> tmp_vel;
+            for(int joint=0; joint<K4ABT_JOINT_COUNT; joint++){
+                if(f==3){
+                    k4a_float3_t tmp_j0 = mJoint_Traj.Traj_skesB[f-1].joints[joint].position;
+                    k4a_float3_t tmp_j1 = mJoint_Traj.Traj_skesB[f].joints[joint].position;
+                    k4a_float3_t tmp_j2 = mJoint_Traj.Traj_skesB[f+1].joints[joint].position;
+                    float t0 = times[f] - times[f-1];
+                    float t1 = times[f+1] - times[f];
+                    float v1_x = (tmp_j1.xyz.x - tmp_j0.xyz.x) / t0;
+                    float v2_x = (tmp_j2.xyz.x - tmp_j1.xyz.x) / t1;
+                    float v1_y = (tmp_j1.xyz.y - tmp_j0.xyz.y) / t0;
+                    float v2_y = (tmp_j2.xyz.y - tmp_j1.xyz.y) / t1;
+                    float v1_z = (tmp_j1.xyz.z - tmp_j0.xyz.z) / t0;
+                    float v2_z = (tmp_j2.xyz.z - tmp_j1.xyz.z) / t1;
+                    if(v1_x * v2_x > 0){
+                        tmp.xyz.x = v1_x * t0 + v2_x * t1;
+                    } else {
+                        tmp.xyz.x = 0.0;
+                    }
+                    if(v1_y * v2_y > 0){
+                        tmp.xyz.y = v1_y * t0 + v2_y * t1;
+                    } else {
+                        tmp.xyz.y = 0.0;
+                    }
+                    if(v1_z * v2_z > 0){
+                        tmp.xyz.z = v1_z * t0 + v2_z * t1;
+                    } else {
+                        tmp.xyz.z = 0.0;
+                    }
+                    tmp_vel.push_back(tmp);
+                } else {
+                    tmp.xyz.x = mJoint_Traj.Traj_velB[3][joint].xyz.x * 0.5;
+                    tmp.xyz.y = mJoint_Traj.Traj_velB[3][joint].xyz.y * 0.5;
+                    tmp.xyz.z = mJoint_Traj.Traj_velB[3][joint].xyz.z * 0.5;
+                    tmp_vel.push_back(tmp);
+                }
+            }
+            mJoint_Traj.Traj_velB.push_back(tmp_vel);
+        }
+    }
+
+//    std::string p = "/home/cpii/Desktop/test_graph/Joint_Traj/" + std::to_string(mJoint_Traj.tmpf) + ".csv";
+//    std::ofstream myFile(p);
+//    for(int f=0; f<4; f++){
+//        int joint = K4ABT_JOINT_HAND_LEFT;
+//        k4a_float3_t tmp_j0 = mJoint_Traj.Traj_skesB[f].joints[joint].position;
+//        k4a_float3_t tmp_j1 = mJoint_Traj.Traj_skesB[f+1].joints[joint].position;
+//        k4a_float3_t tmp_v0 = mJoint_Traj.Traj_velB[f][joint];
+//        k4a_float3_t tmp_v1 = mJoint_Traj.Traj_velB[f+1][joint];
+//        poly_solu_xyz solu = solve_polynomial_trajectory(tmp_j0, tmp_j1,
+//                                                         tmp_v0, tmp_v1,
+//                                                         times[f], times[f+1]);
+//        for(int t=0; t<int((times[f+1]-times[f])*1000); t++){
+//            float time = float(t)*0.001+times[f];
+//            float x = solu.x.a0 + solu.x.a1*time + solu.x.a2*time*time + solu.x.a3*time*time*time;
+//            float y = solu.y.a0 + solu.y.a1*time + solu.y.a2*time*time + solu.y.a3*time*time*time;
+//            float z = solu.z.a0 + solu.z.a1*time + solu.z.a2*time*time + solu.z.a3*time*time*time;
+
+//            myFile << time;
+//            myFile << " ";
+//            myFile << x;
+//            myFile << " ";
+//            myFile << y;
+//            myFile << " ";
+//            myFile << z;
+//            myFile << "\n";
+//        }
+//    }
+//    myFile.close();
+//    mJoint_Traj.tmpf += 2;
+
+    // Calculate the solution for the third frame
+    for(int joint=0; joint<K4ABT_JOINT_COUNT; joint++){
+        k4a_float3_t tmp_j0 = mJoint_Traj.Traj_skesB[2].joints[joint].position;
+        k4a_float3_t tmp_j1 = mJoint_Traj.Traj_skesB[3].joints[joint].position;
+        k4a_float3_t tmp_v0 = mJoint_Traj.Traj_velB[2][joint];
+        k4a_float3_t tmp_v1 = mJoint_Traj.Traj_velB[3][joint];
+        poly_solu_xyz solu = solve_polynomial_trajectory(tmp_j0, tmp_j1,
+                                                         tmp_v0, tmp_v1,
+                                                         times[2], times[3]);
+
+        float time = (float(mJoint_Traj.Traj_timestampsA[2] + mJoint_Traj.Traj_timestampsA[3]) * 0.5 - float(Start_t))*0.001;
+        cal_xyz(solu, time, joint);
+    }
+}
+
+void LP_Plugin_MotionTracking::erase_traj(){
+    mJoint_Traj.Traj_skesB.erase(mJoint_Traj.Traj_skesB.begin());
+    mJoint_Traj.Traj_timestampsA.erase(mJoint_Traj.Traj_timestampsA.begin());
+    mJoint_Traj.Traj_timestampsB.erase(mJoint_Traj.Traj_timestampsB.begin());
+    mJoint_Traj.Traj_velB.erase(mJoint_Traj.Traj_velB.begin());
+    mJoint_Traj.Traj_velB.pop_back();
+}
+
+void LP_Plugin_MotionTracking::Process_AllJointTraj(){
+    qDebug() << "Processing all joint trajetory";
+
+    k4a_float3_t tmp;
+    std::vector<float> times;
+    std::vector<std::vector<k4a_float3_t>> traj_velB;
+    uint64_t Start_t = mSkeData.cam0_t_ori[0] < mSkeData.cam1_t_ori[0] ? mSkeData.cam0_t_ori[0] : mSkeData.cam1_t_ori[0];
+
+    for(int f=0; f<mSkeData.cam1_t_ori.size(); f++){
+        times.push_back(float(mSkeData.cam1_t_ori[f] - mSkeData.cam1_t_ori[0])*0.001);
+    }
+
+    for(int f=0; f<mSkeData.cam1_t_ori.size(); f++){
+        std::vector<k4a_float3_t> tmp_vel;
+        for(int joint=0; joint<K4ABT_JOINT_COUNT; joint++){
+            if(f==0 || f==mSkeData.cam1_t_ori.size()-1){
+                tmp.xyz.x = 0.0;
+                tmp.xyz.y = 0.0;
+                tmp.xyz.z = 0.0;
+                tmp_vel.push_back(tmp);
+            } else {
+                k4a_float3_t tmp_j0 = mSkeData.skes1[f-1].joints[joint].position;
+                k4a_float3_t tmp_j1 = mSkeData.skes1[f].joints[joint].position;
+                k4a_float3_t tmp_j2 = mSkeData.skes1[f+1].joints[joint].position;
+                float t0 = times[f] - times[f-1];
+                float t1 = times[f+1] - times[f];
+                float v1_x = (tmp_j1.xyz.x - tmp_j0.xyz.x) / t0;
+                float v2_x = (tmp_j2.xyz.x - tmp_j1.xyz.x) / t1;
+                float v1_y = (tmp_j1.xyz.y - tmp_j0.xyz.y) / t0;
+                float v2_y = (tmp_j2.xyz.y - tmp_j1.xyz.y) / t1;
+                float v1_z = (tmp_j1.xyz.z - tmp_j0.xyz.z) / t0;
+                float v2_z = (tmp_j2.xyz.z - tmp_j1.xyz.z) / t1;
+                if(v1_x * v2_x > 0){
+                    tmp.xyz.x = v1_x * t0 + v2_x * t1;
+                } else {
+                    tmp.xyz.x = 0.0;
+                }
+                if(v1_y * v2_y > 0){
+                    tmp.xyz.y = v1_y * t0 + v2_y * t1;
+                } else {
+                    tmp.xyz.y = 0.0;
+                }
+                if(v1_z * v2_z > 0){
+                    tmp.xyz.z = v1_z * t0 + v2_z * t1;
+                } else {
+                    tmp.xyz.z = 0.0;
+                }
+                tmp_vel.push_back(tmp);
+            }
+        }
+        traj_velB.push_back(tmp_vel);
+    }
+
+    for(int f=0; f<mSkeData.cam1_t_ori.size()-1; f++){
+        k4abt_skeleton_t tmpb;
+        for(int joint=0; joint<K4ABT_JOINT_COUNT; joint++){
+            k4a_float3_t tmp_j0 = mSkeData.skes1[f].joints[joint].position;
+            k4a_float3_t tmp_j1 = mSkeData.skes1[f+1].joints[joint].position;
+            k4a_float3_t tmp_v0 = traj_velB[f][joint];
+            k4a_float3_t tmp_v1 = traj_velB[f+1][joint];
+            poly_solu_xyz solu = solve_polynomial_trajectory(tmp_j0, tmp_j1,
+                                                             tmp_v0, tmp_v1,
+                                                             times[f], times[f+1]);
+
+            float time = (float(mSkeData.cam0_t_ori[f] + mSkeData.cam0_t_ori[f+1]) * 0.5 - float(Start_t))*0.001;
+            tmpb.joints[joint].position.xyz.x = solu.x.a0 + solu.x.a1*time + solu.x.a2*time*time + solu.x.a3*time*time*time;
+            tmpb.joints[joint].position.xyz.y = solu.y.a0 + solu.y.a1*time + solu.y.a2*time*time + solu.y.a3*time*time*time;
+            tmpb.joints[joint].position.xyz.z = solu.z.a0 + solu.z.a1*time + solu.z.a2*time*time + solu.z.a3*time*time*time;
+        }
+        bodyb_all.push_back(tmpb);
+    }
+    bodyb_all.push_back(mSkeData.skes1.back());
+
+    QString path("/home/cpii/Desktop/test_img/camall/");
+    if(!QDir(path).exists()){
+        QDir().mkdir(path);
+    }
+    std::string p = "/home/cpii/Desktop/test_graph/Joint_AllTraj/Joint_AllTraj.csv";
+    std::ofstream myFile(p);
+    mJoint_tmp_num = 32; joint_a_num = 32; joint_b_num = 32; mBone_tmp_num = 31; bone_a_num = 31; bone_b_num = 31;
+    for(int f=0; f<mSkeData.cam1_t_ori.size(); f++){
+        if(f==0){
+            SkeletonoperationRunoptimizationall(0, f);
+            myFile << mRest_skeleton.joints[K4ABT_JOINT_HAND_LEFT].position.xyz.x;
+            myFile << " ";
+            myFile << mRest_skeleton.joints[K4ABT_JOINT_HAND_LEFT].position.xyz.y;
+            myFile << " ";
+            myFile << mRest_skeleton.joints[K4ABT_JOINT_HAND_LEFT].position.xyz.z;
+            myFile << "\n";
+        } else {
+            SkeletonoperationRunoptimizationall(1, f);
+            myFile << mRest_skeleton.joints[K4ABT_JOINT_HAND_LEFT].position.xyz.x;
+            myFile << " ";
+            myFile << mRest_skeleton.joints[K4ABT_JOINT_HAND_LEFT].position.xyz.y;
+            myFile << " ";
+            myFile << mRest_skeleton.joints[K4ABT_JOINT_HAND_LEFT].position.xyz.z;
+            myFile << "\n";
+            SkeletonoperationRunoptimizationall(0, f);
+            myFile << mRest_skeleton.joints[K4ABT_JOINT_HAND_LEFT].position.xyz.x;
+            myFile << " ";
+            myFile << mRest_skeleton.joints[K4ABT_JOINT_HAND_LEFT].position.xyz.y;
+            myFile << " ";
+            myFile << mRest_skeleton.joints[K4ABT_JOINT_HAND_LEFT].position.xyz.z;
+            myFile << "\n";
+        }
+    }
+    myFile.close();
+}
+
 QWidget *LP_Plugin_MotionTracking::DockUi()
 {
     mWidget = std::make_shared<QWidget>();
@@ -341,36 +666,7 @@ QWidget *LP_Plugin_MotionTracking::DockUi()
             mSave_samples = true;
             boolText = mSave_samples ? "true" : "false";
             qDebug() << "Save samples: " << boolText;
-            if(!QDir(QString::fromStdString(mCam0_path)).exists()){
-                QDir().mkdir(QString::fromStdString(mCam0_path));
-            }
-            if(!QDir(QString::fromStdString(mCam0obj_path)).exists()){
-                QDir().mkdir(QString::fromStdString(mCam0obj_path));
-            }
-            if(!QDir(QString::fromStdString(mCam1_path)).exists()){
-                QDir().mkdir(QString::fromStdString(mCam1_path));
-            }
-            if(!QDir(QString::fromStdString(mCam1obj_path)).exists()){
-                QDir().mkdir(QString::fromStdString(mCam1obj_path));
-            }
-            if(!QDir(QString::fromStdString(mSke0_path)).exists()){
-                QDir().mkdir(QString::fromStdString(mSke0_path));
-            }
-            if(!QDir(QString::fromStdString(mSke0obj_path)).exists()){
-                QDir().mkdir(QString::fromStdString(mSke0obj_path));
-            }
-            if(!QDir(QString::fromStdString(mSke1_path)).exists()){
-                QDir().mkdir(QString::fromStdString(mSke1_path));
-            }
-            if(!QDir(QString::fromStdString(mSke1obj_path)).exists()){
-                QDir().mkdir(QString::fromStdString(mSke1obj_path));
-            }
-            if(!QDir(QString::fromStdString(mCam0ir_path)).exists()){
-                QDir().mkdir(QString::fromStdString(mCam0ir_path));
-            }
-            if(!QDir(QString::fromStdString(mCam1ir_path)).exists()){
-                QDir().mkdir(QString::fromStdString(mCam1ir_path));
-            }
+            create_paths();
         } else {
             qDebug() << "Cannot test animation, use model and start camera first!";
         }
@@ -382,6 +678,8 @@ QWidget *LP_Plugin_MotionTracking::DockUi()
 bool LP_Plugin_MotionTracking::Run()
 {
     D = std::make_shared<Model_member>();
+
+    //KAfunctions = std::make_shared<Kinect_Azure_Functions>();
 
     // rigid_transform_3D_test();
 
@@ -493,6 +791,8 @@ void LP_Plugin_MotionTracking::RunCamera()
         trackers[dev_ind] = std::move(tracker);
         sensorCalibrations[dev_ind] = std::move(sensorCalibration);
         k4a_transformations[dev_ind] = std::move(transformation);
+
+        //QThread::msleep(20);
       }
 
       std::vector<k4a_capture_t> sensorCaptures(device_count);
@@ -509,31 +809,11 @@ void LP_Plugin_MotionTracking::RunCamera()
       auto start_time_opt = std::chrono::high_resolution_clock::now();
       auto now_opt = std::chrono::high_resolution_clock::now();
 
+      float _durr = 0.0;
+      int opt_times = 0;
+
       if(mSave_samples){
-          if(!QDir(QString::fromStdString(mCam0_path)).exists()){
-              QDir().mkdir(QString::fromStdString(mCam0_path));
-          }
-          if(!QDir(QString::fromStdString(mCam0obj_path)).exists()){
-              QDir().mkdir(QString::fromStdString(mCam0obj_path));
-          }
-          if(!QDir(QString::fromStdString(mCam1_path)).exists()){
-              QDir().mkdir(QString::fromStdString(mCam1_path));
-          }
-          if(!QDir(QString::fromStdString(mCam1obj_path)).exists()){
-              QDir().mkdir(QString::fromStdString(mCam1obj_path));
-          }
-          if(!QDir(QString::fromStdString(mSke0_path)).exists()){
-              QDir().mkdir(QString::fromStdString(mSke0_path));
-          }
-          if(!QDir(QString::fromStdString(mSke0obj_path)).exists()){
-              QDir().mkdir(QString::fromStdString(mSke0obj_path));
-          }
-          if(!QDir(QString::fromStdString(mSke1_path)).exists()){
-              QDir().mkdir(QString::fromStdString(mSke1_path));
-          }
-          if(!QDir(QString::fromStdString(mSke1obj_path)).exists()){
-              QDir().mkdir(QString::fromStdString(mSke1obj_path));
-          }
+          create_paths();
       }
 
 //      QString qs;
@@ -577,7 +857,6 @@ void LP_Plugin_MotionTracking::RunCamera()
           k4a_wait_result_t getCaptureResult =
               k4a_device_get_capture(devices[dev_ind], &sensorCaptures[dev_ind],
                                      0); // timeout_in_ms is set to 0
-
           if (getCaptureResult == K4A_WAIT_RESULT_SUCCEEDED) {
               if(D->mUse_Model){
                   k4a_image_t cimg = k4a_capture_get_color_image(sensorCaptures[dev_ind]);
@@ -615,7 +894,6 @@ void LP_Plugin_MotionTracking::RunCamera()
 
                       //process on color k4a image
                       k4a_image_t transformed_depth_image = NULL;
-
                       VERIFY(k4a_image_create(K4A_IMAGE_FORMAT_DEPTH16,
                                               mCam_cols,
                                               mCam_rows,
@@ -625,7 +903,7 @@ void LP_Plugin_MotionTracking::RunCamera()
                       VERIFY(k4a_transformation_depth_image_to_color_camera(k4a_transformations[dev_ind],
                                                                             dimg,
                                                                             transformed_depth_image),
-                             "Fail to transform depth image to color image!");
+                             "Failed to transform depth image to color image!");
                       uint8_t *buffer = k4a_image_get_buffer(transformed_depth_image);
                       cv::Mat transformed_depth_image_mat(mCam_rows, mCam_cols, CV_16UC1, (void *)buffer, cv::Mat::AUTO_STEP);
                       transformed_depth_image_mat = transformed_depth_image_mat/15.0;
@@ -670,7 +948,6 @@ void LP_Plugin_MotionTracking::RunCamera()
 
                       //process on color k4a image
                       k4a_image_t transformed_depth_image = NULL;
-
                       VERIFY(k4a_image_create(K4A_IMAGE_FORMAT_DEPTH16,
                                               mCam_cols,
                                               mCam_rows,
@@ -680,7 +957,7 @@ void LP_Plugin_MotionTracking::RunCamera()
                       VERIFY(k4a_transformation_depth_image_to_color_camera(k4a_transformations[dev_ind],
                                                                             dimg,
                                                                             transformed_depth_image),
-                             "Fail to transform depth image to color image!");
+                             "Failed to transform depth image to color image!");
                       uint8_t *buffer = k4a_image_get_buffer(transformed_depth_image);
                       cv::Mat transformed_depth_image_mat(mCam_rows, mCam_cols, CV_16UC1, (void *)buffer, cv::Mat::AUTO_STEP);
                       transformed_depth_image_mat = transformed_depth_image_mat/15.0;
@@ -696,6 +973,7 @@ void LP_Plugin_MotionTracking::RunCamera()
                   k4a_image_release(dimg);
                   k4a_image_release(irimg);
               }
+
             // CV MAT TO K4A COLOR IMAGE ///////////////////////////////////////////////////////////////////////////////
   //          k4a_image_t cimg = k4a_capture_get_color_image(sensorCaptures[dev_ind]);
   //          int colorh = k4a_image_get_height_pixels(cimg);
@@ -726,7 +1004,6 @@ void LP_Plugin_MotionTracking::RunCamera()
 
             if (queueCaptureResult == K4A_WAIT_RESULT_FAILED) {
               qDebug() << "Error! Add capture to tracker process queue failed!";
-              //k4abt_tracker_destroy(trackers[dev_ind]);
               continue;
             }
           } else if (getCaptureResult != K4A_WAIT_RESULT_TIMEOUT) {
@@ -738,7 +1015,6 @@ void LP_Plugin_MotionTracking::RunCamera()
           k4abt_frame_t bodyFrame = nullptr;
           k4a_wait_result_t popFrameResult = k4abt_tracker_pop_result(
               trackers[dev_ind], &bodyFrame, 0); // timeout_in_ms is set to 0
-          //k4abt_tracker_destroy(trackers[dev_ind]);
 
           if (popFrameResult == K4A_WAIT_RESULT_SUCCEEDED) {
             if (bodyFrames[dev_ind] != nullptr) {
@@ -747,10 +1023,21 @@ void LP_Plugin_MotionTracking::RunCamera()
             }
             bodyFrames[dev_ind] = std::move(bodyFrame);
           }
-          QThread::msleep(1);
+
+          if(dev_ind==0){
+              QThread::msleep(5);
+          }
         }
 
         if(bodyFrames[0] == nullptr || bodyFrames[1] == nullptr){
+            if(bodyFrames[0] != nullptr){
+                bodyFrames[0] == nullptr;
+                //qDebug() << "Null body frame 0!";
+            }
+            if(bodyFrames[1] != nullptr){
+                bodyFrames[1] == nullptr;
+                //qDebug() << "Null body frame 1!";
+            }
             continue;
         } else {
             // Skip captures without a color image inside the while loop
@@ -759,6 +1046,7 @@ void LP_Plugin_MotionTracking::RunCamera()
             k4a_image_t image_color0 = k4a_capture_get_color_image(originalCapture0);
             k4a_image_t image_color1 = k4a_capture_get_color_image(originalCapture1);
             if(image_color0 == nullptr || image_color1 == nullptr){
+                qDebug() << "Null color images!";
                 k4a_capture_release(originalCapture0);
                 k4a_capture_release(originalCapture1);
                 k4a_image_release(image_color0);
@@ -767,6 +1055,8 @@ void LP_Plugin_MotionTracking::RunCamera()
                 originalCapture1 = nullptr;
                 image_color0 = nullptr;
                 image_color1 = nullptr;
+                bodyFrames[0] == nullptr;
+                bodyFrames[1] == nullptr;
                 continue;
             }
         }
@@ -785,6 +1075,7 @@ void LP_Plugin_MotionTracking::RunCamera()
                 joint_a_num = 0;
                 bone_a_num = 0;
                 got_skea = false;
+                //KAfunctions->clear();
               } else {
                 joint_b_num = 0;
                 bone_b_num = 0;
@@ -793,26 +1084,30 @@ void LP_Plugin_MotionTracking::RunCamera()
             }
 
             // Visualize
-            VisualizeResult(bodyFrames[dev_ind], sensorCalibrations[dev_ind], dev_ind);
+            VisualizeResult(bodyFrames[dev_ind], sensorCalibrations[dev_ind], k4a_transformations[dev_ind], dev_ind);
         }
+        //qDebug() << "================================================";
 
         if (mUse_Opt && got_skea && got_skeb) {
-            //auto _start = std::chrono::high_resolution_clock::now();
+            auto _start = std::chrono::high_resolution_clock::now();
             if (!mInitSKO) {
               SkeletonoperationInit();
               start_time_opt = std::chrono::high_resolution_clock::now();
-            } else {
-              if(cam1_t.size()>1){
+            } else if(mJoint_Traj.Traj_skesB.size()==mJoint_Traj.TrajFrame_Size) {
+              if(mSkeData.cam1_t.size()>1){
                 SkeletonoperationRunoptimization(1);
-                //auto _end = std::chrono::high_resolution_clock::now();
-                //float _durr = std::chrono::duration_cast<std::chrono::milliseconds>(_end - _start).count();
+                auto _end = std::chrono::high_resolution_clock::now();
+                _durr += std::chrono::duration_cast<std::chrono::milliseconds>(_end - _start).count();
+                opt_times++;
                 //qDebug() << "optimization total time (1): " << _durr;
               }
               SkeletonoperationRunoptimization(0);
-              //auto _end = std::chrono::high_resolution_clock::now();
-              //float _durr = std::chrono::duration_cast<std::chrono::milliseconds>(_end - _start).count();
+              auto _end = std::chrono::high_resolution_clock::now();
+              _durr += std::chrono::duration_cast<std::chrono::milliseconds>(_end - _start).count();
+              opt_times++;
               //qDebug() << "optimization total time (0): " << _durr;
               lastbody_b = tmpbody_b;
+              erase_traj();
             }
 
             now_opt = std::chrono::high_resolution_clock::now();
@@ -821,8 +1116,11 @@ void LP_Plugin_MotionTracking::RunCamera()
               start_time_opt = now_opt;
               qDebug() << "=====================================================\n"
                        << "--SKEOPT FPS: " << optfps_count << "--\n"
+                       << "--Average SKEOPT Durration: " << _durr / float(opt_times) << "--\n"
                        << "=====================================================";
               optfps_count = 0;
+              _durr = 0.0;
+              opt_times = 0;
             }
         } else if(D->mTest_Animation){
             qDebug() << "Skip skeopt.";
@@ -833,13 +1131,15 @@ void LP_Plugin_MotionTracking::RunCamera()
         }
 
         if(!mSave_samples){
-            if(cam0_t.size() > 3){
-                cam0_t.erase(cam0_t.begin());
+            if(mSkeData.cam0_t.size() > 3){
+                mSkeData.cam0_t.erase(mSkeData.cam0_t.begin());
             }
-            if(cam1_t.size() > 3){
-                cam1_t.erase(cam1_t.begin());
+            if(mSkeData.cam1_t.size() > 3){
+                mSkeData.cam1_t.erase(mSkeData.cam1_t.begin());
             }
-        } else if ((cam0_t.size() > 150 && cam1_t.size() > 150 && !D->mTest_Animation)) {
+        } else if ((mSkeData.cam0_t.size() > 150 && mSkeData.cam1_t.size() > 150 && !D->mTest_Animation)) {
+            Process_AllJointTraj();
+
             save_samples();
 
             qDebug() << "GG";
@@ -887,6 +1187,7 @@ void LP_Plugin_MotionTracking::RunCamera()
         }
       }
 
+
       for (unsigned int dev_ind = 0; dev_ind < device_count; dev_ind++) {
         k4abt_tracker_shutdown(trackers[dev_ind]);
         k4abt_tracker_destroy(trackers[dev_ind]);
@@ -900,6 +1201,7 @@ void LP_Plugin_MotionTracking::RunCamera()
 
 void LP_Plugin_MotionTracking::VisualizeResult(k4abt_frame_t bodyFrame,
                                                k4a_calibration_t sensorCalibration,
+                                               k4a_transformation_t transformation,
                                                int dev_ind) {
   // Obtain original capture that generates the body tracking result
   k4a_capture_t originalCapture = k4abt_frame_get_capture(bodyFrame);
@@ -917,9 +1219,13 @@ void LP_Plugin_MotionTracking::VisualizeResult(k4abt_frame_t bodyFrame,
   uint8_t *buffer = k4a_image_get_buffer(colorImage);
   uint8_t *Dbuffer = k4a_image_get_buffer(depthImage);
   uint8_t *IRbuffer = k4a_image_get_buffer(irImage);
-  cv::Mat colorMat(mCam_rows, mCam_cols, CV_8UC4, (void *)buffer, cv::Mat::AUTO_STEP);
-  cv::Mat dImg(mDepthh, mDepthw, CV_16UC1, (void *)Dbuffer, cv::Mat::AUTO_STEP);
-  cv::Mat irImg(mDepthh, mDepthw, CV_16UC1, (void *)IRbuffer, cv::Mat::AUTO_STEP);
+  cv::Mat tmpColorMat(mCam_rows, mCam_cols, CV_8UC4, (void *)buffer, cv::Mat::AUTO_STEP);
+  cv::Mat tmpDImg(mDepthh, mDepthw, CV_16UC1, (void *)Dbuffer, cv::Mat::AUTO_STEP);
+  cv::Mat tmpIrImg(mDepthh, mDepthw, CV_16UC1, (void *)IRbuffer, cv::Mat::AUTO_STEP);
+  cv::Mat colorMat = tmpColorMat.clone();
+  cv::Mat dImg = tmpDImg.clone();
+  cv::Mat irImg = tmpIrImg.clone();
+  cv::Mat colorMat_ori = colorMat.clone();
 
 //    if(!s && dev_ind==0){
 //        std::ofstream myFile("dimg.csv");
@@ -1122,7 +1428,7 @@ void LP_Plugin_MotionTracking::VisualizeResult(k4abt_frame_t bodyFrame,
                 mKinectB_pts.col(col) = mKinectB_pts.col(col) + tmpb;
             }
             mAvg_count++;
-            qDebug() << mAvg_count << "/" << 15;
+            qDebug() << "[ " << mAvg_count << " / 15 ]";
             if(mAvg_count == 15){
                 mKinectA_pts = mKinectA_pts / double(mAvg_count);
                 mKinectB_pts = mKinectB_pts / double(mAvg_count);
@@ -1148,12 +1454,7 @@ void LP_Plugin_MotionTracking::VisualizeResult(k4abt_frame_t bodyFrame,
                 std::cout << "RMSE:\n" << rmse << std::endl;
 
                 if(mSave_samples || D->mUse_Model){
-                    std::string path0mesh = "/home/cpii/Desktop/test_img/RT_A.obj";
-                    std::string path1mesh = "/home/cpii/Desktop/test_img/RT_B.obj";
-                    std::string pathkmesh = "/home/cpii/Desktop/test_img/RT_K.obj";
-                    save_obj(path0mesh, mKinectA_pts);
-                    save_obj(path1mesh, mKinectB_pts);
-                    save_obj(pathkmesh, Aligned_skeb);
+                    save_Rt(Aligned_skeb);
                 }
             }
         }
@@ -1162,8 +1463,10 @@ void LP_Plugin_MotionTracking::VisualizeResult(k4abt_frame_t bodyFrame,
     if (mUse_Opt) {
       int n = D->frame/2;
       if (dev_ind == 0) {
-          mTmpMat = colorMat.clone();
-          mTmpirMat = irImg.clone();
+//          if(!KAfunctions->point_cloud_color_to_depth(transformation, depthImage, colorImage, dev_ind)){
+//              qDebug() << "Failed to get point cloud!";
+//          }
+
           if(joint_a_num == 32 && bone_a_num == 31){
               mTmpFrametime = frametime;
               tmpbody_a = body.skeleton;
@@ -1171,89 +1474,129 @@ void LP_Plugin_MotionTracking::VisualizeResult(k4abt_frame_t bodyFrame,
               //qDebug() << "Got a pose!";
           }
       } else if(got_skea && joint_b_num == 32 && bone_b_num == 31) {
-        tmpbody_b = body.skeleton;
-        cv::Mat tmp_mat = cv::Mat::zeros(3, 32, CV_64F);
-        for(int col=0; col<32; col++){
-            const k4a_float3_t &jointPosition = body.skeleton.joints[col].position;
-            cv::Mat tmp = (cv::Mat_<double>(3, 1) << jointPosition.xyz.x,
-                                                     jointPosition.xyz.y,
-                                                     jointPosition.xyz.z);
-            tmp_mat.col(col) = tmp_mat.col(col) + tmp;
-        }
-        cv::Mat Aligned_skeb =  mRet.R * tmp_mat;
-        for(int col=0; col<Aligned_skeb.cols; col++){
-            Aligned_skeb.col(col) = Aligned_skeb.col(col) + mRet.t;
-        }
+          cv::Mat tmp_mat = cv::Mat::zeros(3, 32, CV_64F);
+            for(int col=0; col<32; col++){
+              const k4a_float3_t &jointPosition = body.skeleton.joints[col].position;
+              cv::Mat tmp = (cv::Mat_<double>(3, 1) << jointPosition.xyz.x,
+                                                       jointPosition.xyz.y,
+                                                       jointPosition.xyz.z);
+              tmp_mat.col(col) = tmp_mat.col(col) + tmp;
+          }
+          cv::Mat Aligned_skeb =  mRet.R * tmp_mat;
+          for(int col=0; col<Aligned_skeb.cols; col++){
+              Aligned_skeb.col(col) = Aligned_skeb.col(col) + mRet.t;
+          }
 
-        for(int joint=0; joint<joint_b_num; joint++){
-            tmpbody_b.joints[joint].position.xyz.x = Aligned_skeb.at<double>(0, joint);
-            tmpbody_b.joints[joint].position.xyz.y = Aligned_skeb.at<double>(1, joint);
-            tmpbody_b.joints[joint].position.xyz.z = Aligned_skeb.at<double>(2, joint);
-        }
-        got_skeb = true;
-        //qDebug() << "Got b pose!";
+          for(int joint=0; joint<joint_b_num; joint++){
+              tmpbody_b.joints[joint].position.xyz.x = Aligned_skeb.at<double>(0, joint);
+              tmpbody_b.joints[joint].position.xyz.y = Aligned_skeb.at<double>(1, joint);
+              tmpbody_b.joints[joint].position.xyz.z = Aligned_skeb.at<double>(2, joint);
+          }
+          got_skeb = true;
+          //qDebug() << "Got b pose!";
 
-        if(mInitSKO){
-            cam0_t.push_back(mTmpFrametime);
-            cam1_t.push_back(frametime);
+          mJoint_Traj.Traj_timestampsA.push_back(mTmpFrametime);
+          mJoint_Traj.Traj_timestampsB.push_back(frametime);
+          mJoint_Traj.Traj_skesB.push_back(tmpbody_b);
+          mSkeData.skes1ori.push_back(tmpbody_b);
 
-            if(mSave_samples){
-                int n0 = cam0_t.size()-1;
-                int n1 = cam1_t.size()-1;
-                if(D->mTest_Animation){
-                    n0 = n;
-                    n1 = n;
-                }
-                std::string path0 = mCam0_path + std::to_string(n0) + ".jpg";
-                //cv::rotate(mTmpMat, mTmpMat, cv::ROTATE_90_COUNTERCLOCKWISE);
-                cv::imwrite(path0, mTmpMat);
-                //cv::rotate(mTmpMat, mTmpMat, cv::ROTATE_90_CLOCKWISE);
+          if(mInitSKO && mJoint_Traj.Traj_skesB.size()==mJoint_Traj.TrajFrame_Size){
+              Process_JointTraj();
+              uint64_t adjusted_tB = 0.5 * (mJoint_Traj.Traj_timestampsA[2] + mJoint_Traj.Traj_timestampsA[3]);
+              //qDebug() << "adjusted_tB: " << adjusted_tB;
 
-                std::string path1 = mCam1_path + std::to_string(n1) + ".jpg";
-                //cv::rotate(colorMat, colorMat, cv::ROTATE_90_COUNTERCLOCKWISE);
-                cv::imwrite(path1, colorMat);
-                //cv::rotate(colorMat, colorMat, cv::ROTATE_90_CLOCKWISE);
+              // Use the third point of trajectory
+              // 1 2 "3" 4 5
+              static bool once = [this](){
+                  mSkeData.StartTime = mJoint_Traj.Traj_timestampsA[2];
+                  return true;
+              }();
+              mSkeData.cam0_t_ori.push_back(mJoint_Traj.Traj_timestampsA[2]);
+              mSkeData.cam1_t_ori.push_back(mJoint_Traj.Traj_timestampsB[2]);
+              mSkeData.cam0_t.push_back(mJoint_Traj.Traj_timestampsA[2] - mSkeData.StartTime);
+              mSkeData.cam1_t.push_back(adjusted_tB - mSkeData.StartTime);
+              //qDebug() << "cam0_t: " << mSkeData.cam0_t.back();
+              //qDebug() << "cam1_t: " << mSkeData.cam1_t.back();
 
-                path0 = mCam0ir_path + std::to_string(n0) + ".jpg";
-                cv::Mat save_mat = mTmpirMat.clone()/greyscaled_ir;
-                //cv::rotate(save_mat, save_mat, cv::ROTATE_90_COUNTERCLOCKWISE);
-                cv::imwrite(path0, save_mat);
+              if(mSave_samples){
+                  int n0 = mSkeData.cam0_t.size()-1;
+                  int n1 = mSkeData.cam1_t.size()-1;
+                  if(D->mTest_Animation){
+                      n0 = n;
+                      n1 = n;
+                  }
+                  mSkeData.colorMats0.push_back(mTmpMatA.clone());
+                  mSkeData.colorMats1.push_back(mTmpMatB.clone());
+                  mSkeData.colorMatoris0.push_back(mTmpMatOriA.clone());
+                  mSkeData.colorMatoris1.push_back(mTmpMatOriB.clone());
+                  mSkeData.irMats0.push_back(mTmpirMatA.clone()/greyscaled_ir);
+                  mSkeData.irMats1.push_back(mTmpirMatB.clone()/greyscaled_ir);
+                  mSkeData.skes0.push_back(tmpbody_a);
+                  mSkeData.skes1.push_back(tmpbody_b);
 
-                path1 = mCam1ir_path + std::to_string(n1) + ".jpg";
-                save_mat = irImg.clone()/greyscaled_ir;
-                //cv::rotate(save_mat, save_mat, cv::ROTATE_90_COUNTERCLOCKWISE);
-                cv::imwrite(path1, save_mat);
-
-                std::string path0mesh = mCam0obj_path + std::to_string(n0) + ".obj";
-                std::string path1mesh = mCam1obj_path + std::to_string(n1) + ".obj";
-                save_obj(path0mesh, &tmpbody_a);
-                save_obj(path1mesh, &tmpbody_b);
-            }
-        }
+//                  if(!D->mUse_Model) {
+//                      // Get point cloud
+//                      if(!KAfunctions->point_cloud_color_to_depth(transformation, depthImage, colorImage, dev_ind)){
+//                          qDebug() << "Failed to get point cloud!";
+//                      }
+//                      KAfunctions->point_cloud_image0[n0] = std::move(KAfunctions->tmpPoint_cloud_image0);
+//                      KAfunctions->point_cloud_image1[n1] = std::move(KAfunctions->tmpPoint_cloud_image1);
+//                      KAfunctions->transformed_color_image0[n0] = std::move(KAfunctions->tmpTransformed_color_image0);
+//                      KAfunctions->transformed_color_image1[n1] = std::move(KAfunctions->tmpTransformed_color_image1);
+//                  }
+              }
+          }
       } else if (mInitSKO && D->mTest_Animation){
           qDebug() << "joint_b_num: " << joint_b_num << "\n"
                    << "bone_b_num: " << bone_b_num;
-          std::string path0 = mCam0_path + std::to_string(n) + ".jpg";
-          //cv::rotate(mTmpMat, mTmpMat, cv::ROTATE_90_COUNTERCLOCKWISE);
-          cv::imwrite(path0, mTmpMat);
-          //cv::rotate(mTmpMat, mTmpMat, cv::ROTATE_90_CLOCKWISE);
 
-          path0 = mCam0ir_path + std::to_string(n) + ".jpg";
-          cv::Mat saveimg = mTmpirMat/greyscaled_ir;
-          //cv::rotate(saveimg, saveimg, cv::ROTATE_90_COUNTERCLOCKWISE);
-          cv::imwrite(path0, saveimg);
-
-          std::string path1 = mCam1_path + std::to_string(n) + ".jpg";
-          //cv::rotate(colorMat, colorMat, cv::ROTATE_90_COUNTERCLOCKWISE);
-          cv::imwrite(path1, colorMat);
-          //cv::rotate(colorMat, colorMat, cv::ROTATE_90_CLOCKWISE);
-
-          path1 = mCam1ir_path + std::to_string(n) + ".jpg";
-          saveimg = irImg/greyscaled_ir;
-          //cv::rotate(saveimg, saveimg, cv::ROTATE_90_COUNTERCLOCKWISE);
-          cv::imwrite(path1, saveimg);
+          mSkeData.colorMats0.push_back(mTmpMatA.clone());
+          mSkeData.colorMats1.push_back(mTmpMatB.clone());
+          mSkeData.colorMatoris0.push_back(mTmpMatOriA.clone());
+          mSkeData.colorMatoris1.push_back(mTmpMatOriB.clone());
+          mSkeData.irMats0.push_back(mTmpirMatA.clone()/greyscaled_ir);
+          mSkeData.irMats1.push_back(mTmpirMatB.clone()/greyscaled_ir);
+      } else if (!got_skea) {
+          qDebug() << "Can not get skeleton A!\n"
+                   << "joint_a_num: " << joint_a_num << "\n"
+                   << "bone_a_num: " << bone_a_num;
+      } else if (got_skea) {
+          qDebug() << "Can not get skeleton B!\n"
+                   << "joint_b_num: " << joint_b_num << "\n"
+                   << "bone_b_num: " << bone_b_num;
       }
     }
+  }
+
+  if(mUse_Opt){
+      if(!init_tmpmat){
+          if(dev_ind == 0 && joint_a_num == 32 && bone_a_num == 31){
+              mTmpMatA_Last = colorMat.clone();
+              mTmpMatOriA_Last = colorMat_ori.clone();
+              mTmpirMatA_Last = irImg.clone();
+          } else if (got_skea && joint_b_num == 32 && bone_b_num == 31) {
+              mTmpMatB_Last = colorMat.clone();
+              mTmpMatOriB_Last = colorMat_ori.clone();
+              mTmpirMatB_Last = irImg.clone();
+              init_tmpmat = true;
+          }
+      } else {
+          if(dev_ind == 0 && joint_a_num == 32 && bone_a_num == 31){
+              mTmpMatA = mTmpMatA_Last.clone();
+              mTmpMatOriA = mTmpMatOriA_Last.clone();
+              mTmpirMatA = mTmpirMatA_Last.clone();
+              mTmpMatA_Last = colorMat.clone();
+              mTmpMatOriA_Last = colorMat_ori.clone();
+              mTmpirMatA_Last = irImg.clone();
+          } else if (got_skea && joint_b_num == 32 && bone_b_num == 31) {
+              mTmpMatB = mTmpMatB_Last.clone();
+              mTmpMatOriB = mTmpMatOriB_Last.clone();
+              mTmpirMatB = mTmpirMatB_Last.clone();
+              mTmpMatB_Last = colorMat.clone();
+              mTmpMatOriB_Last = colorMat_ori.clone();
+              mTmpirMatB_Last = irImg.clone();
+          }
+      }
   }
 
   if(dev_ind == 0){
@@ -1304,7 +1647,8 @@ void LP_Plugin_MotionTracking::SkeletonoperationInit() {
   //qDebug() << jointNum << " " << boneNum << " " << modelNum;
 
   if (skeOpt == NULL) {
-    skeOpt = new SkeletonOpt(modelNum, jointNum, boneNum); // create the object
+      skeOpt = std::make_shared<SkeletonOpt>(modelNum, jointNum, boneNum);
+      //skeOpt = new SkeletonOpt(modelNum, jointNum, boneNum); // create the object
   }
 
   ////initialize array containing points
@@ -1331,10 +1675,6 @@ void LP_Plugin_MotionTracking::SkeletonoperationInit() {
 
   // set edges and length
   // constrain/////////////////////////////////////////////////////////////
-  if (length_const.empty()) {
-    length_const.resize(boneNum);
-  }
-
   for (int bone = 0; bone < boneNum; bone++) {
     k4abt_joint_id_t n1 = g_boneList[bone].first;
     k4abt_joint_id_t n2 = g_boneList[bone].second;
@@ -1348,8 +1688,6 @@ void LP_Plugin_MotionTracking::SkeletonoperationInit() {
                              pow(templateModel->joints[n2].position.xyz.z -
                                      templateModel->joints[n1].position.xyz.z,
                                  2));
-
-    length_const[bone] = edg_length;
 
     if (!skeOpt->InsertEdge(bone, n1, n2)) {
       qDebug() << "edge insertion failed!\n";
@@ -1419,11 +1757,18 @@ void LP_Plugin_MotionTracking::SkeletonoperationRunoptimization(int use_cam) {
   k4abt_skeleton_t *templateModel = NULL, *model1 = NULL,
                    *model2 = NULL; // Objects storing skeleton data
   templateModel = &mRest_skeleton; // a template storing the Rest pose of the candidate
-  model1 = &tmpbody_a; // model1: skeleton data from Kinect A
+//  model1 = &tmpbody_a; // model1: skeleton data from Kinect A
+//  if(use_cam == 0){
+//      model2 = &tmpbody_b; // model2: skeleton data from Kinect B
+//  } else {
+//      model2 = &lastbody_b;// model2: last skeleton data from Kinect B
+//  }
   if(use_cam == 0){
+      model1 = &tmpbody_a; // model1: skeleton data from Kinect A
       model2 = &tmpbody_b; // model2: skeleton data from Kinect B
   } else {
-      model2 = &lastbody_b;// model2: last skeleton data from Kinect B
+      model1 = &lastbody_b;// model1: last skeleton data from Kinect B
+      model2 = &tmpbody_a; // model2: skeleton data from Kinect A
   }
 
   // check the validity of skeletons captured from
@@ -1461,7 +1806,7 @@ void LP_Plugin_MotionTracking::SkeletonoperationRunoptimization(int use_cam) {
   //////////////////////////////////////////////////////////////////////////////////////
   // function solving inconsistency of skeletons : Referring to Chapter 3 of
   // paper
-  checking_estpoint_new(nodearray1, nodearray2);
+  checking_estpoint_new(nodearray1, nodearray2, use_cam);
   //////////////////////////////////////////////////////////////////////////////////////
 
   // input the data of points in 2 skeletons into SkeletonOpt
@@ -1511,10 +1856,10 @@ void LP_Plugin_MotionTracking::SkeletonoperationRunoptimization(int use_cam) {
       }
 
       for (int i = 0; i < 3; i++) {
-        if (!skeOpt->SetModelVertexWeight(m, vdx, i, weighting)) {
-          qDebug() << "set model weighting failed!\n";
-          return;
-        }
+          if (!skeOpt->SetModelVertexWeight(m, vdx, i, weighting)) {
+            qDebug() << "set model weighting failed!\n";
+            return;
+          }
       }
     }
   }
@@ -1525,8 +1870,7 @@ void LP_Plugin_MotionTracking::SkeletonoperationRunoptimization(int use_cam) {
 
   skeOpt->Run(50, true); // Run the program
 
-  // get back the
-  // result/////////////////////////////////////////////////////////////////////////////
+  // get back the result/////////////////////////////////////////////////////////////////////////////
   for (int joint = 0; joint < jointNum; joint++) {
     double x, y, z;
 
@@ -1540,7 +1884,9 @@ void LP_Plugin_MotionTracking::SkeletonoperationRunoptimization(int use_cam) {
     templateModel->joints[joint].position.xyz.z = z;
   }
 
-  cv::Mat colorMat(mCam_rows, mCam_cols, CV_8UC4, cv::Scalar(255, 255, 255, 255));
+  cv::Mat colorMat;
+  k4abt_skeleton_t draw_ske = *templateModel;
+  colorMat = mTmpMatOriA.clone();
 
   // Assign the correct color based on the body id
   Color color = g_bodyColors[0];
@@ -1548,18 +1894,31 @@ void LP_Plugin_MotionTracking::SkeletonoperationRunoptimization(int use_cam) {
 
   // Visualize joints
   for (int joint = 0; joint < jointNum; joint++) {
-    const k4a_float3_t &jointPosition = templateModel->joints[joint].position;
-    // const k4a_quaternion_t &jointOrientation =
-    // body.skeleton.joints[joint].orientation;
+    const k4a_float3_t &jointPosition = draw_ske.joints[joint].position;
 
     k4a_float2_t joint2d;
     int valid;
     k4a_calibration_3d_to_2d(&sensorCalibrations[0], &jointPosition,
                              K4A_CALIBRATION_TYPE_DEPTH,
                              K4A_CALIBRATION_TYPE_COLOR, &joint2d, &valid);
+    cv::Point Point2d = cv::Point(int(joint2d.xy.x), int(joint2d.xy.y));
     if (valid) {
       Color joint_color = color;
-      cv::circle(colorMat, cv::Point(int(joint2d.xy.x), int(joint2d.xy.y)), 6,
+//      if(use_cam==0){
+//          if(joint==6){
+//              mSkeData.ELBOW_LEFT0.push_back(Point2d);
+//          } else if(joint==7){
+//              mSkeData.WRIST_LEFT0.push_back(Point2d);
+//          }
+//      } else {
+//          if(joint==6){
+//              mSkeData.ELBOW_LEFT1.push_back(Point2d);
+//          } else if(joint==7){
+//              mSkeData.WRIST_LEFT1.push_back(Point2d);
+//          }
+//      }
+
+      cv::circle(colorMat, Point2d, 6,
                  cv::Scalar(joint_color.b * 255, joint_color.g * 255,
                             joint_color.r * 255, joint_color.a * 255),
                  cv::FILLED, cv::LINE_8);
@@ -1571,8 +1930,8 @@ void LP_Plugin_MotionTracking::SkeletonoperationRunoptimization(int use_cam) {
     k4abt_joint_id_t joint1 = g_boneList[boneIdx].first;
     k4abt_joint_id_t joint2 = g_boneList[boneIdx].second;
 
-    const k4a_float3_t &joint1Position = templateModel->joints[joint1].position;
-    const k4a_float3_t &joint2Position = templateModel->joints[joint2].position;
+    const k4a_float3_t &joint1Position = draw_ske.joints[joint1].position;
+    const k4a_float3_t &joint2Position = draw_ske.joints[joint2].position;
     k4a_float2_t joint2d_1, joint2d_2;
     int valid1, valid2;
     k4a_calibration_3d_to_2d(&sensorCalibrations[0], &joint1Position,
@@ -1593,9 +1952,9 @@ void LP_Plugin_MotionTracking::SkeletonoperationRunoptimization(int use_cam) {
 
   std::string timetext;
   if(use_cam == 0){
-      timetext = std::to_string(cam0_t.back());
+      timetext = std::to_string(mSkeData.cam0_t.back());
   } else {
-      timetext = std::to_string(cam1_t[cam1_t.size()-2]);
+      timetext = std::to_string(mSkeData.cam1_t[mSkeData.cam1_t.size()-2]);
   }
 
   cv::putText(colorMat, //target image
@@ -1611,35 +1970,28 @@ void LP_Plugin_MotionTracking::SkeletonoperationRunoptimization(int use_cam) {
       for(int j=0; j<jointNum;j++){
           tmp_jointposi.push_back(templateModel->joints[j].position);
       }
-      mJoint_posis.push_back(tmp_jointposi);
-      if(mTimestamps.size()==0){
-          mTimestamps.push_back(0.0);
+      mSkeData.Joint_posis.push_back(tmp_jointposi);
+
+      if(mSkeData.Timestamps.size()==0){
+          mSkeData.Timestamps.push_back(0.0);
       } else {
-          mTimestamps.push_back(use_cam==0 ? float(cam0_t.back()-cam1_t[cam1_t.size()-2])*0.001 : float(cam1_t.back()-cam0_t.back())*0.001);
+          std::pair<uint64_t, uint64_t> m =
+                  use_cam ? std::minmax(mSkeData.cam0_t[mSkeData.cam0_t.size()-2], mSkeData.cam1_t[mSkeData.cam1_t.size()-2]) : std::minmax(mSkeData.cam0_t.back(), mSkeData.cam1_t[mSkeData.cam1_t.size()-2]);
+          mSkeData.Timestamps.push_back(float(m.second-m.first)*0.001);
       }
 
-      int n0 = cam0_t.size()-1;
-      int n1 = cam1_t.size()-2;
+      int n0 = mSkeData.cam0_t.size()-1;
+      int n1 = mSkeData.cam1_t.size()-2;
       if(D->mTest_Animation){
           n0 = D->frame/2;
           n1 = D->frame/2;
       }
       if(use_cam == 0){
-          std::string path = mSke0_path + std::to_string(n0) + ".jpg";
-          //cv::rotate(colorMat, colorMat, cv::ROTATE_90_COUNTERCLOCKWISE);
-          cv::imwrite(path, colorMat);
-          //cv::rotate(colorMat, colorMat, cv::ROTATE_90_CLOCKWISE);
-
-          std::string pathmesh = mSke0obj_path + std::to_string(n0) + ".obj";
-          save_obj(pathmesh, templateModel);
+          mSkeData.optskeMats0.push_back(colorMat);
+          mSkeData.optskes0.push_back(*templateModel);
       } else {
-          std::string path = mSke1_path + std::to_string(n1) + ".jpg";
-          //cv::rotate(colorMat, colorMat, cv::ROTATE_90_COUNTERCLOCKWISE);
-          cv::imwrite(path, colorMat);
-          //cv::rotate(colorMat, colorMat, cv::ROTATE_90_CLOCKWISE);
-
-          std::string pathmesh = mSke1obj_path + std::to_string(n1) + ".obj";
-          save_obj(pathmesh, templateModel);
+          mSkeData.optskeMats1.push_back(colorMat);
+          mSkeData.optskes1.push_back(*templateModel);
       }
   }
 
@@ -1650,11 +2002,200 @@ void LP_Plugin_MotionTracking::SkeletonoperationRunoptimization(int use_cam) {
   optfps_count++;
 }
 
+void LP_Plugin_MotionTracking::SkeletonoperationRunoptimizationall(int use_cam, int frame) {
+  k4abt_skeleton_t *templateModel = NULL, *model1 = NULL,
+                   *model2 = NULL; // Objects storing skeleton data
+
+  templateModel = &mRest_skeleton; // a template storing the Rest pose of the candidate
+  if(use_cam == 0){
+      model1 = &mSkeData.skes0[frame]; // model1: skeleton data from Kinect A
+      model2 = &bodyb_all[frame]; // model2: skeleton data from Kinect B
+  } else {
+      model1 = &bodyb_all[frame-1];// model1: last skeleton data from Kinect B
+      model2 = &mSkeData.skes0[frame]; // model2: skeleton data from Kinect A
+  }
+
+  //////////////////////////////////////////////////////////////////////////////////////////////////
+  int jointNum = mJoint_tmp_num; // number of joint in skeleton
+  int modelNum = 2; // number of skeletons or number of cameras
+
+  ////initialize array containing points
+  /// information////////////////////////////////////
+  k4abt_joint_t **nodearray1 = new k4abt_joint_t *[jointNum];
+  k4abt_joint_t **nodearray2 = new k4abt_joint_t *[jointNum];
+
+  for (int joint = 0; joint < jointNum; joint++) {
+    k4abt_joint_t *node1 = &model1->joints[joint];
+    nodearray1[joint] = node1; // put all the data into the array
+
+    k4abt_joint_t *node2 = &model2->joints[joint];
+    nodearray2[joint] = node2; // put all the data into the array
+  }
+  //////////////////////////////////////////////////////////////////////////////////////
+  // function solving inconsistency of skeletons : Referring to Chapter 3 of
+  // paper
+  checking_estpoint_new(nodearray1, nodearray2, use_cam);
+  //////////////////////////////////////////////////////////////////////////////////////
+
+  // input the data of points in 2 skeletons into SkeletonOpt
+  // Object//////////////////////
+  // set initial value from
+  // template////////////////////////////////////////////////////////////
+  for (int joint = 0; joint < jointNum; joint++) {
+    k4abt_joint_t *joint1 = &model1->joints[joint];
+    k4abt_joint_t *joint2 = &model2->joints[joint];
+    k4abt_joint_t *node = &templateModel->joints[joint];
+    //tmparray[joint] = node;
+
+    double x1, y1, z1, x2, y2, z2, x3, y3, z3;
+    x1 = joint1->position.xyz.x;
+    y1 = joint1->position.xyz.y;
+    z1 = joint1->position.xyz.z;
+    x2 = joint2->position.xyz.x;
+    y2 = joint2->position.xyz.y;
+    z2 = joint2->position.xyz.z;
+    x3 = node->position.xyz.x;
+    y3 = node->position.xyz.y;
+    z3 = node->position.xyz.z;
+    if (!skeOpt->InsertNode(0, joint, x1, y1, z1)) {
+      qDebug() << "insert failed!\n";
+      return;
+    }
+    if (!skeOpt->InsertNode(1, joint, x2, y2, z2)) {
+      qDebug() << "insert failed!\n";
+      return;
+    }
+    if (!skeOpt->SetInitialVertexPosition(joint, x3, y3, z3)) {
+      qDebug() << "set initial position failed!\n";
+      return;
+    }
+  }
+  //////////////////////////////////////////////////////////////////////////////////
+
+  // set weighting;
+  for (int m = 0; m < modelNum; m++) {
+    for (int vdx = 0; vdx < jointNum; vdx++) {
+      double weighting = 1.0 / modelNum;
+
+      if (m == 0) {
+        weighting = weighting_a[vdx];
+      } else if (m == 1) {
+        weighting = weighting_b[vdx];
+      }
+
+      for (int i = 0; i < 3; i++) {
+          if (!skeOpt->SetModelVertexWeight(m, vdx, i, weighting)) {
+            qDebug() << "set model weighting failed!\n";
+            return;
+          }
+      }
+    }
+  }
+  delete[] nodearray1;
+  delete[] nodearray2;
+  //delete[] tmparray;
+  // ready to Run ///////////////////////////////////////////
+
+  skeOpt->Run(50, true); // Run the program
+
+  // get back the result/////////////////////////////////////////////////////////////////////////////
+  for (int joint = 0; joint < jointNum; joint++) {
+    double x, y, z;
+
+    if (!skeOpt->GetVertexPosition(joint, x, y, z)) {
+      qDebug() << "get vertex position failed!\n";
+      return;
+    }
+
+    templateModel->joints[joint].position.xyz.x = x;
+    templateModel->joints[joint].position.xyz.y = y;
+    templateModel->joints[joint].position.xyz.z = z;
+  }
+
+  cv::Mat colorMat;
+  k4abt_skeleton_t draw_ske = *templateModel;
+  colorMat = mSkeData.colorMatoris0[frame].clone();
+
+  // Assign the correct color based on the body id
+  Color color = g_bodyColors[0];
+  color.a = 0.4f;
+
+  // Visualize joints
+  for (int joint = 0; joint < jointNum; joint++) {
+    const k4a_float3_t &jointPosition = draw_ske.joints[joint].position;
+
+    k4a_float2_t joint2d;
+    int valid;
+    k4a_calibration_3d_to_2d(&sensorCalibrations[0], &jointPosition,
+                             K4A_CALIBRATION_TYPE_DEPTH,
+                             K4A_CALIBRATION_TYPE_COLOR, &joint2d, &valid);
+    cv::Point Point2d = cv::Point(int(joint2d.xy.x), int(joint2d.xy.y));
+    if (valid) {
+      Color joint_color = color;
+      cv::circle(colorMat, Point2d, 6,
+                 cv::Scalar(joint_color.b * 255, joint_color.g * 255,
+                            joint_color.r * 255, joint_color.a * 255),
+                 cv::FILLED, cv::LINE_8);
+    }
+  }
+
+  // Visualize bones
+  for (size_t boneIdx = 0; boneIdx < g_boneList.size(); boneIdx++) {
+    k4abt_joint_id_t joint1 = g_boneList[boneIdx].first;
+    k4abt_joint_id_t joint2 = g_boneList[boneIdx].second;
+
+    const k4a_float3_t &joint1Position = draw_ske.joints[joint1].position;
+    const k4a_float3_t &joint2Position = draw_ske.joints[joint2].position;
+    k4a_float2_t joint2d_1, joint2d_2;
+    int valid1, valid2;
+    k4a_calibration_3d_to_2d(&sensorCalibrations[0], &joint1Position,
+                             K4A_CALIBRATION_TYPE_DEPTH,
+                             K4A_CALIBRATION_TYPE_COLOR, &joint2d_1, &valid1);
+    k4a_calibration_3d_to_2d(&sensorCalibrations[0], &joint2Position,
+                             K4A_CALIBRATION_TYPE_DEPTH,
+                             K4A_CALIBRATION_TYPE_COLOR, &joint2d_2, &valid2);
+    if (valid1 && valid2) {
+      Color bone_color = color;
+      cv::line(colorMat, cv::Point(int(joint2d_1.xy.x), int(joint2d_1.xy.y)),
+               cv::Point(int(joint2d_2.xy.x), int(joint2d_2.xy.y)),
+               cv::Scalar(bone_color.b * 255, bone_color.g * 255,
+                          bone_color.r * 255, bone_color.a * 255),
+               5, cv::LINE_4);
+    }
+  }
+
+  std::string timetext;
+  if(use_cam == 0){
+      timetext = std::to_string(mSkeData.cam0_t[frame]);
+  } else {
+      timetext = std::to_string(mSkeData.cam1_t[frame-1]);
+  }
+
+  cv::putText(colorMat, //target image
+              timetext, //text
+              cv::Point(10, 80), //top-left position
+              cv::FONT_HERSHEY_SIMPLEX,
+              3.0,
+              cv::Scalar(0, 0, 255, 255), //font color
+              4.0);
+
+  int id = 0;
+  if(use_cam==0){
+      id = frame*2;
+  } else {
+      id = (frame-1)*2+1;
+  }
+  std::string path = "/home/cpii/Desktop/test_img/camall/" + std::to_string(id) + ".png";
+  cv::imwrite(path, colorMat);
+
+  colorMat.release();
+}
+
 void LP_Plugin_MotionTracking::checking_estpoint_new(k4abt_joint_t **skea,
-                                       k4abt_joint_t **skeb) {
+                                                     k4abt_joint_t **skeb,
+                                                     int use_cam) {
   /////////////////////////////////////////////////////////////
-  int size = mJoint_tmp_num;
-  for (int i = 0; i < size; i++) {
+  for (int i = 0; i < mJoint_tmp_num; i++) {
     k4abt_joint_t *nodea = skea[i];
     k4abt_joint_t *nodeb = skeb[i];
     /*
@@ -1681,9 +2222,10 @@ void LP_Plugin_MotionTracking::checking_estpoint_new(k4abt_joint_t **skea,
       // Kinect
       weighting_a[i] = 0.5;
       weighting_b[i] = 0.5;
-      cam_prior_new(skea, skeb, i);
+
+      cam_prior_new(skea, skeb, i, use_cam);
     } else {
-      cam_prior_new(skea, skeb, i);
+      cam_prior_new(skea, skeb, i, use_cam);
     }
     /////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1691,8 +2233,10 @@ void LP_Plugin_MotionTracking::checking_estpoint_new(k4abt_joint_t **skea,
   }
 }
 
-void LP_Plugin_MotionTracking::cam_prior_new(k4abt_joint_t **skea, k4abt_joint_t **skeb,
-                               int jointpoint) {
+void LP_Plugin_MotionTracking::cam_prior_new(k4abt_joint_t **skea,
+                                             k4abt_joint_t **skeb,
+                                             int jointpoint,
+                                             int use_cam) {
   // initialize value////////////////////////////////////////////////////////
   int k = 4;
   // double infer_ratio = 0.3;
@@ -1718,9 +2262,8 @@ void LP_Plugin_MotionTracking::cam_prior_new(k4abt_joint_t **skea, k4abt_joint_t
   x2 = skea[corres_jpoint]->position.xyz.x;
   y2 = skea[corres_jpoint]->position.xyz.y;
   z2 = skea[corres_jpoint]->position.xyz.z;
-  double dis_a = sqrt((x1 - x2) * (x1 - x2));
-  //double dis_a = sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2) +
-  //                    (z1 - z2) * (z1 - z2));
+  //double dis_a = sqrt((x1 - x2) * (x1 - x2));
+  double dis_a = sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2) + (z1 - z2) * (z1 - z2));
 
   // Kinect B///////////////////////////////////////////////////////
   x1 = skeb[jointpoint]->position.xyz.x; // coordinate of points without affine
@@ -1730,9 +2273,8 @@ void LP_Plugin_MotionTracking::cam_prior_new(k4abt_joint_t **skea, k4abt_joint_t
   x2 = skeb[corres_jpoint]->position.xyz.x;
   y2 = skeb[corres_jpoint]->position.xyz.y;
   z2 = skeb[corres_jpoint]->position.xyz.z;
-  double dis_b = sqrt((x1 - x2) * (x1 - x2));
-  //double dis_b = sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2) +
-  //                    (z1 - z2) * (z1 - z2));
+  //double dis_b = sqrt((x1 - x2) * (x1 - x2));
+  double dis_b = sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2) + (z1 - z2) * (z1 - z2));
   // printf("dis_a: %lf\n dis_b: %lf\n", dis_a, dis_b);
 
   ////////////////////////////////////////////////////
@@ -1863,9 +2405,9 @@ int LP_Plugin_MotionTracking::choosing_dis(k4abt_joint_t **skea, k4abt_joint_t *
     x2 = nei_node->position.xyz.x;
     y2 = nei_node->position.xyz.y;
     z2 = nei_node->position.xyz.z;
-    //dis_nei[i] = sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2) + (z1 - z2) * (z1 - z2));
-    dis_nei[i] = sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2));
-    // dis_nei[i] = sqrt((x1-x2)*(x1-x2));
+    dis_nei[i] = sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2) + (z1 - z2) * (z1 - z2));
+    //dis_nei[i] = sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2));
+    //dis_nei[i] = sqrt((x1-x2)*(x1-x2));
     if (dis_nei[i] < min_dis_a) {
       min_dis_a = dis_nei[i];
       nei_a_no = i;
@@ -1938,9 +2480,9 @@ int LP_Plugin_MotionTracking::choosing_dis(k4abt_joint_t **skea, k4abt_joint_t *
     x2 = nei_node->position.xyz.x;
     y2 = nei_node->position.xyz.y;
     z2 = nei_node->position.xyz.z;
-    //dis_nei[i] = sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2) + (z1 - z2) * (z1 - z2));
-    dis_nei[i] = sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2));
-    // dis_nei[i] = sqrt((x1-x2)*(x1-x2));
+    dis_nei[i] = sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2) + (z1 - z2) * (z1 - z2));
+    //dis_nei[i] = sqrt((x1 - x2) * (x1 - x2) + (y1 - y2) * (y1 - y2));
+    //dis_nei[i] = sqrt((x1-x2)*(x1-x2));
     if (dis_nei[i] < min_dis_b) {
       min_dis_b = dis_nei[i];
       nei_b_no = i;
@@ -2109,6 +2651,85 @@ void LP_Plugin_MotionTracking::loadObj(const char *filename,
     }
 }
 
+void LP_Plugin_MotionTracking::create_paths(){
+    if(!QDir(QString::fromStdString(mCam0_path)).exists()){
+        QDir().mkdir(QString::fromStdString(mCam0_path));
+    }
+    if(!QDir(QString::fromStdString(mCam0ori_path)).exists()){
+        QDir().mkdir(QString::fromStdString(mCam0ori_path));
+    }
+    if(!QDir(QString::fromStdString(mCam0ske_path)).exists()){
+        QDir().mkdir(QString::fromStdString(mCam0ske_path));
+    }
+    if(!QDir(QString::fromStdString(mCam1_path)).exists()){
+        QDir().mkdir(QString::fromStdString(mCam1_path));
+    }
+    if(!QDir(QString::fromStdString(mCam1ori_path)).exists()){
+        QDir().mkdir(QString::fromStdString(mCam1ori_path));
+    }
+    if(!QDir(QString::fromStdString(mCam1ske_path)).exists()){
+        QDir().mkdir(QString::fromStdString(mCam1ske_path));
+    }
+    if(!QDir(QString::fromStdString(mCam1skeori_path)).exists()){
+        QDir().mkdir(QString::fromStdString(mCam1skeori_path));
+    }
+    if(!QDir(QString::fromStdString(mSke0_path)).exists()){
+        QDir().mkdir(QString::fromStdString(mSke0_path));
+    }
+    if(!QDir(QString::fromStdString(mSke0obj_path)).exists()){
+        QDir().mkdir(QString::fromStdString(mSke0obj_path));
+    }
+    if(!QDir(QString::fromStdString(mSke_path)).exists()){
+        QDir().mkdir(QString::fromStdString(mSke_path));
+    }
+    if(!QDir(QString::fromStdString(mSke1_path)).exists()){
+        QDir().mkdir(QString::fromStdString(mSke1_path));
+    }
+    if(!QDir(QString::fromStdString(mSke1obj_path)).exists()){
+        QDir().mkdir(QString::fromStdString(mSke1obj_path));
+    }
+    if(!QDir(QString::fromStdString(mCam0ir_path)).exists()){
+        QDir().mkdir(QString::fromStdString(mCam0ir_path));
+    }
+    if(!QDir(QString::fromStdString(mCam1ir_path)).exists()){
+        QDir().mkdir(QString::fromStdString(mCam1ir_path));
+    }
+//    if(!QDir(QString::fromStdString(mPointcloud_path0)).exists()){
+//        QDir().mkdir(QString::fromStdString(mPointcloud_path0));
+//    }
+//    if(!QDir(QString::fromStdString(mPointcloud_path1)).exists()){
+//        QDir().mkdir(QString::fromStdString(mPointcloud_path1));
+//    }
+}
+
+void LP_Plugin_MotionTracking::save_Rt(cv::Mat Aligned_skeb){
+    std::string path0mesh = "/home/cpii/Desktop/test_img/RT_A.obj";
+    std::string path1mesh = "/home/cpii/Desktop/test_img/RT_B.obj";
+    std::string pathkmesh = "/home/cpii/Desktop/test_img/RT_K.obj";
+    std::string pathRt = "/home/cpii/Desktop/test_img/Rt.csv";
+
+    save_obj(path0mesh, mKinectA_pts);
+    save_obj(path1mesh, mKinectB_pts);
+    save_obj(pathkmesh, Aligned_skeb);
+    std::ofstream myFile(pathRt);
+    for (size_t i = 0; i < mRet.R.rows; ++i) {
+        for (size_t j = 0; j < mRet.R.cols; ++j) {
+            myFile << mRet.R.at<double>(i, j);
+            if(i!=(mRet.R.rows-1) || j!=(mRet.R.cols-1)){
+                myFile << " ";
+            }
+        }
+    }
+    myFile << "\n";
+    for (size_t i = 0; i < mRet.t.rows; ++i) {
+        myFile << mRet.t.at<double>(i, 0);
+        if(i!=(mRet.t.rows-1)){
+            myFile << " ";
+        }
+    }
+    myFile.close();
+}
+
 void LP_Plugin_MotionTracking::save_obj(std::string path, cv::Mat mat){
     std::ofstream myFile(path);
     for (int repeat = 0; repeat < 2; repeat++){
@@ -2160,33 +2781,107 @@ void LP_Plugin_MotionTracking::save_obj(std::string path, k4abt_skeleton_t *ske)
 }
 
 void LP_Plugin_MotionTracking::save_samples(){
+    qDebug() << "Saving samples";
+    // save images and obj
+    for(int i=0; i<mSkeData.colorMats0.size(); i++){
+        std::string path = mCam0_path + std::to_string(i*2) + ".png";
+        //cv::rotate(mTmpMat, mTmpMat, cv::ROTATE_90_COUNTERCLOCKWISE);
+        cv::imwrite(path, mSkeData.colorMats0[i]);
+        //cv::rotate(mTmpMat, mTmpMat, cv::ROTATE_90_CLOCKWISE);
+
+        path = mCam1_path + std::to_string(i*2+1) + ".png";
+        //cv::rotate(colorMat, colorMat, cv::ROTATE_90_COUNTERCLOCKWISE);
+        cv::imwrite(path, mSkeData.colorMats1[i]);
+        //cv::rotate(colorMat, colorMat, cv::ROTATE_90_CLOCKWISE);
+
+        path = mCam0ori_path + std::to_string(i*2) + ".png";
+        cv::imwrite(path, mSkeData.colorMatoris0[i]);
+
+        path = mCam1ori_path + std::to_string(i*2+1) + ".png";
+        cv::imwrite(path, mSkeData.colorMatoris1[i]);
+
+        path = mCam0ir_path + std::to_string(i*2) + ".jpg";
+        //cv::rotate(save_mat, save_mat, cv::ROTATE_90_COUNTERCLOCKWISE);
+        cv::imwrite(path, mSkeData.irMats0[i]);
+
+        path = mCam1ir_path + std::to_string(i*2+1) + ".jpg";
+        //cv::rotate(save_mat, save_mat, cv::ROTATE_90_COUNTERCLOCKWISE);
+        cv::imwrite(path, mSkeData.irMats1[i]);
+
+        path = mSke_path + std::to_string(i*2) + ".png";
+        //cv::rotate(colorMat, colorMat, cv::ROTATE_90_COUNTERCLOCKWISE);
+        cv::imwrite(path, mSkeData.optskeMats0[i]);
+        //cv::rotate(colorMat, colorMat, cv::ROTATE_90_CLOCKWISE);
+
+        path = mSke0_path + std::to_string(i*2) + ".png";
+        //cv::rotate(colorMat, colorMat, cv::ROTATE_90_COUNTERCLOCKWISE);
+        cv::imwrite(path, mSkeData.optskeMats0[i]);
+        //cv::rotate(colorMat, colorMat, cv::ROTATE_90_CLOCKWISE);
+
+        path = mSke0obj_path + std::to_string(i*2) + ".obj";
+        save_obj(path, &mSkeData.optskes0[i]);
+
+        if(!D->mUse_Model){
+            std::string path0mesh = mCam0ske_path + std::to_string(i*2) + ".obj";
+            std::string path1mesh = mCam1ske_path + std::to_string(i*2+1) + ".obj";
+            std::string path1orimesh = mCam1skeori_path + std::to_string(i*2+1) + ".obj";
+            save_obj(path0mesh, &mSkeData.skes0[i]);
+            save_obj(path1mesh, &mSkeData.skes1[i]);
+            save_obj(path1orimesh, &mSkeData.skes1ori[i]);
+        }
+    }
+    for(int i=0; i<mSkeData.optskeMats1.size(); i++){
+        std::string path = mSke_path + std::to_string(i*2+1) + ".png";
+        //cv::rotate(colorMat, colorMat, cv::ROTATE_90_COUNTERCLOCKWISE);
+        cv::imwrite(path, mSkeData.optskeMats1[i]);
+        //cv::rotate(colorMat, colorMat, cv::ROTATE_90_CLOCKWISE);
+
+        path = mSke1_path + std::to_string(i*2+1) + ".png";
+        //cv::rotate(colorMat, colorMat, cv::ROTATE_90_COUNTERCLOCKWISE);
+        cv::imwrite(path, mSkeData.optskeMats1[i]);
+        //cv::rotate(colorMat, colorMat, cv::ROTATE_90_CLOCKWISE);
+
+        path = mSke1obj_path + std::to_string(i*2+1) + ".obj";
+        save_obj(path, &mSkeData.optskes1[i]);
+    }
+
     // save cam time
     std::ofstream myFile(mCamtime_path);
-    for (size_t i = 0; i < cam0_t.size(); i++) {
-      myFile << cam0_t[i];
+    for (size_t i = 0; i < mSkeData.cam0_t.size(); i++) {
+      myFile << mSkeData.cam0_t[i];
       myFile << " ";
-      myFile << cam1_t[i];
+      myFile << mSkeData.cam1_t[i];
       myFile << "\n";
     }
     myFile.close();
 
+    // save original cam time
+    std::ofstream myFileo(mCamtimeori_path);
+    for (size_t i = 0; i < mSkeData.cam0_t_ori.size(); i++) {
+      myFileo << mSkeData.cam0_t_ori[i];
+      myFileo << " ";
+      myFileo << mSkeData.cam1_t_ori[i];
+      myFileo << "\n";
+    }
+    myFileo.close();
+
     // save time stamps
     std::ofstream myFile2(mTimestamps_path);
-    for (size_t i = 0; i < mTimestamps.size(); i++) {
-      myFile2 << mTimestamps[i];
+    for (size_t i = 0; i < mSkeData.Timestamps.size(); i++) {
+      myFile2 << mSkeData.Timestamps[i];
       myFile2 << "\n";
     }
     myFile2.close();
 
     // save joint positions
     std::ofstream myFile3(mJointposi_path);
-    for (size_t f = 0; f < mJoint_posis.size(); f++){
-        for (size_t j = 0; j < mJoint_posis[f].size(); j++) {
-          myFile3 << mJoint_posis[f][j].xyz.x;
+    for (size_t f = 0; f < mSkeData.Joint_posis.size(); f++){
+        for (size_t j = 0; j < mSkeData.Joint_posis[f].size(); j++) {
+          myFile3 << mSkeData.Joint_posis[f][j].xyz.x;
           myFile3 << " ";
-          myFile3 << mJoint_posis[f][j].xyz.y;
+          myFile3 << mSkeData.Joint_posis[f][j].xyz.y;
           myFile3 << " ";
-          myFile3 << mJoint_posis[f][j].xyz.z;
+          myFile3 << mSkeData.Joint_posis[f][j].xyz.z;
           myFile3 << " ";
         }
         myFile3 << "\n";
@@ -2194,13 +2889,13 @@ void LP_Plugin_MotionTracking::save_samples(){
     myFile3.close();
 
     // save joint velocity
-    std::vector<k4a_float3_t> velo;
     std::ofstream myFile4(mJointvelo_path);
-    for (size_t f = 0; f < mJoint_posis.size(); f++){
-        float time = mTimestamps[f];
-        for (size_t j = 0; j < mJoint_posis[f].size(); j++) {
+    for (size_t f = 0; f < mSkeData.Joint_posis.size(); f++){
+        float time = mSkeData.Timestamps[f];
+        std::vector<k4a_float3_t> velo;
+        for (size_t j = 0; j < mSkeData.Joint_posis[f].size(); j++) {
             k4a_float3_t tmpv;
-            if(f==0){
+            if(f==mSkeData.Joint_posis.size()-1){
                 tmpv.xyz.x = 0.0;
                 tmpv.xyz.y = 0.0;
                 tmpv.xyz.z = 0.0;
@@ -2213,9 +2908,15 @@ void LP_Plugin_MotionTracking::save_samples(){
                 myFile4 << 0.0;
                 myFile4 << " ";
             } else {
-                float vx = (mJoint_posis[f][j].xyz.x-mJoint_posis[f][j-1].xyz.x)/time;
-                float vy = (mJoint_posis[f][j].xyz.y-mJoint_posis[f][j-1].xyz.y)/time;
-                float vz = (mJoint_posis[f][j].xyz.z-mJoint_posis[f][j-1].xyz.z)/time;
+                // s=1/2(u+v)t -> v=2s/t-u
+//                float vx = 2.0*(mJoint_posis[f][j].xyz.x-mJoint_posis[f-1][j].xyz.x)/time - mJoint_velo[f-1][j].xyz.x;
+//                float vy = 2.0*(mJoint_posis[f][j].xyz.y-mJoint_posis[f-1][j].xyz.y)/time - mJoint_velo[f-1][j].xyz.y;
+//                float vz = 2.0*(mJoint_posis[f][j].xyz.z-mJoint_posis[f-1][j].xyz.z)/time - mJoint_velo[f-1][j].xyz.z;
+
+                // s=vt -> v=s/t
+                float vx = (mSkeData.Joint_posis[f+1][j].xyz.x-mSkeData.Joint_posis[f][j].xyz.x)/time;
+                float vy = (mSkeData.Joint_posis[f+1][j].xyz.y-mSkeData.Joint_posis[f][j].xyz.y)/time;
+                float vz = (mSkeData.Joint_posis[f+1][j].xyz.z-mSkeData.Joint_posis[f][j].xyz.z)/time;
 
                 tmpv.xyz.x = vx;
                 tmpv.xyz.y = vy;
@@ -2231,16 +2932,16 @@ void LP_Plugin_MotionTracking::save_samples(){
             }
         }
         myFile4 << "\n";
-        mJoint_velo.push_back(velo);
+        mSkeData.Joint_velo.push_back(velo);
     }
     myFile4.close();
 
     // save joint acceleration
     std::ofstream myFile5(mJointacce_path);
-    for (size_t f = 0; f < mJoint_velo.size(); f++){
-        float time = mTimestamps[f];
-        for (size_t j = 0; j < mJoint_velo[f].size(); j++) {
-            if(f==mJoint_velo[f].size()-1){
+    for (size_t f = 0; f < mSkeData.Joint_velo.size(); f++){
+        float time = mSkeData.Timestamps[f+1];
+        for (size_t j = 0; j < mSkeData.Joint_velo[f].size(); j++) {
+            if(f==mSkeData.Joint_velo.size()-1){
                 myFile5 << 0.0;
                 myFile5 << " ";
                 myFile5 << 0.0;
@@ -2248,17 +2949,45 @@ void LP_Plugin_MotionTracking::save_samples(){
                 myFile5 << 0.0;
                 myFile5 << " ";
             } else {
-                myFile5 << (mJoint_velo[f][j+1].xyz.x-mJoint_velo[f][j].xyz.x)/time;
+                // v=u+at -> a=(v-u)/t
+                myFile5 << (mSkeData.Joint_velo[f+1][j].xyz.x-mSkeData.Joint_velo[f][j].xyz.x)/time;
                 myFile5 << " ";
-                myFile5 << (mJoint_velo[f][j+1].xyz.y-mJoint_velo[f][j].xyz.y)/time;
+                myFile5 << (mSkeData.Joint_velo[f+1][j].xyz.y-mSkeData.Joint_velo[f][j].xyz.y)/time;
                 myFile5 << " ";
-                myFile5 << (mJoint_velo[f][j+1].xyz.z-mJoint_velo[f][j].xyz.z)/time;
+                myFile5 << (mSkeData.Joint_velo[f+1][j].xyz.z-mSkeData.Joint_velo[f][j].xyz.z)/time;
                 myFile5 << " ";
             }
         }
         myFile5 << "\n";
     }
     myFile5.close();
+
+//    // save point cloud
+//    KAfunctions->write_point_cloud(mPointcloud_path0, mPointcloud_path1);
+
+    // save 2d Points
+//    std::ofstream myFile6(m2dPoint_path);
+//    for (size_t i = 0; i < mSkeData.ELBOW_LEFT0.size(); i++){
+//        myFile6 << mSkeData.ELBOW_LEFT0[i].x;
+//        myFile6 << " ";
+//        myFile6 << mSkeData.ELBOW_LEFT0[i].y;
+//        myFile6 << " ";
+//        myFile6 << mSkeData.WRIST_LEFT0[i].x;
+//        myFile6 << " ";
+//        myFile6 << mSkeData.WRIST_LEFT0[i].y;
+//        myFile6 << "\n";
+//        if(i<mSkeData.ELBOW_LEFT0.size()-1){
+//            myFile6 << mSkeData.ELBOW_LEFT1[i].x;
+//            myFile6 << " ";
+//            myFile6 << mSkeData.ELBOW_LEFT1[i].y;
+//            myFile6 << " ";
+//            myFile6 << mSkeData.WRIST_LEFT1[i].x;
+//            myFile6 << " ";
+//            myFile6 << mSkeData.WRIST_LEFT1[i].y;
+//            myFile6 << "\n";
+//        }
+//    }
+//    myFile6.close();
 }
 
 void LP_Plugin_MotionTracking::PainterDraw(QWidget *glW)
@@ -2488,7 +3217,6 @@ void LP_Plugin_MotionTracking::Model_member::initializeGL_R_DM(QOpenGLContext *c
 
 void LP_Plugin_MotionTracking::Get_depthmap()
 {
-
     if ( !D->mInitialized_R_DM ) {
         D->initializeGL_R_DM(D->mCB_Context, D->mCB_Surface);
 
@@ -2637,7 +3365,6 @@ void LP_Plugin_MotionTracking::Get_depthmap()
     float Kdpower = 3.0, tmpd = 2500.0, dpower = 2.0, tmpir = 10000.0;
     int height = D->mDepth_Map_color0.height();
     int width = D->mDepth_Map_color0.width();
-    float tmppixeldis = sqrt(pow(float(height)*0.5, 2.0) + pow(float(width)*0.5, 2.0));
     QMatrix4x4 vp;
     vp.viewport(0, 0, width, height);
 
@@ -2677,8 +3404,6 @@ void LP_Plugin_MotionTracking::Get_depthmap()
                 dis1 = 0.0;
             }
 
-            float pixel_dis = sqrt(pow(float(x)-width*0.5, 2.0) + pow(float(y)-height*0.5, 2.0));
-            float pixel_scale = 1.0-pow(pixel_dis/tmppixeldis, 2.0);
             if(dis0 == 0.0){
                 D->mDepth_Map_color0.setPixelColor(x, y, QColor(255.0, 255.0, 255.0, 255.0));
                 D->mDepth_Map_dis0.at<uint16_t>(y, x) = D->mDBackground.at<uint16_t>(y, x);
@@ -2716,7 +3441,6 @@ void LP_Plugin_MotionTracking::Get_depthmap()
                 //qDebug() << "Kd: " << Kd;
                 float Ks = pow(Kd, Kdpower);
                 //qDebug() << "Ks: " << Ks;
-                //D->mIr_Map0.at<uint16_t>(y, x) = Ks*pow((tmpd-dis0)/tmpd, dpower)*pixel_scale*tmpir;
                 D->mIr_Map0.at<uint16_t>(y, x) = Ks*pow((tmpd-dis0)/tmpd, dpower)*tmpir;
                 //qDebug() << "D->mIr_Map0.at<uint16_t>(y, x): " << D->mIr_Map0.at<uint16_t>(y, x);
             }
@@ -2740,7 +3464,6 @@ void LP_Plugin_MotionTracking::Get_depthmap()
                 float Kd = std::max(QVector3D::dotProduct(H, N), 0.f);
                 Kd = std::min(Kd, 1.f);
                 float Ks = pow(Kd, Kdpower);
-                //D->mIr_Map1.at<uint16_t>(y, x) = Ks*pow((tmpd-dis1)/tmpd, dpower)*pixel_scale*tmpir;
                 D->mIr_Map1.at<uint16_t>(y, x) = Ks*pow((tmpd-dis1)/tmpd, dpower)*tmpir;
             }
         }

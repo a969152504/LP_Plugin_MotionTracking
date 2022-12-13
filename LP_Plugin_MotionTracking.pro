@@ -15,10 +15,12 @@ QMAKE_POST_LINK=$(MAKE) install
 
 SOURCES += \
     SkeletonOpt.cpp \
+    kinect_azure_functions.cpp \
     lp_plugin_motiontracking.cpp
 
 HEADERS += \
     LP_Plugin_MotionTracking_global.h \
+    kinect_azure_functions.h \
     lp_plugin_motiontracking.h \
     BodyTrackingHelpers.h \
     SkeletonOpt.h \

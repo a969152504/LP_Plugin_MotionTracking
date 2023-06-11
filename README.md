@@ -6,4 +6,4 @@ and Skeleton Optimization algorithm from the paper below
 Yeung, Kwok-Yun, Tsz-Ho Kwok, and Charlie CL Wang. "Improved skeleton tracking by duplex kinects: A practical approach for real-time applications." Journal of Computing and Information Science in Engineering 13.4 (2013).
 
 ## Sample:
-![Alt Text](https://media.giphy.com/media/vFKqnCdLPNOKc/giphy.gif)
+https://github.com/a969152504/LP_Plugin_MotionTracking/assets/73870357/c1c9fc16-c7c2-48e0-82e9-00b8f1d84d87
